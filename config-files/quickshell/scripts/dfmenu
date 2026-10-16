@@ -1,0 +1,43 @@
+#!/bin/sh
+# dfmenu: a dmenu drawn by the Deep Field bar.
+# Items on stdin, the pick on stdout; exits 1 if you cancel (Esc, click away).
+#
+# Takes wmenu's flags, so in a script `wmenu` can simply become `dfmenu`:
+#   -p PROMPT   heading of the panel        -i   case-insensitive matching
+#   -l N        show at most N rows (default 12)
+#   -b -v -f -o -N -n -M -m -S -s           accepted and ignored
+# If the bar isn't running, it hands everything to wmenu instead.
+#
+# Talks to Picker.qml over $XDG_RUNTIME_DIR/deepfield-picker.sock with nc
+# (OpenBSD netcat, NixOS's default `nc`). See Picker.qml for the protocol.
+# Everything before nc is shell builtins: nc is the only process it starts.
+
+SOCK=${XDG_RUNTIME_DIR:-/tmp}/deepfield-picker.sock
+
+# Is the bar up? It leaves its pid next to the socket. No pid, or a dead one
+# (the bar crashed or was stopped): plain wmenu, same arguments.
+pid=
+[ -S "$SOCK" ] && read -r pid 2>/dev/null < "$SOCK.pid"
+if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    exec wmenu "$@"
+fi
+
+prompt= ci= rows=
+while getopts :bivf:l:o:p:N:n:M:m:S:s: opt; do
+    case $opt in
+        p) prompt=$OPTARG ;;
+        i) ci=i ;;
+        l) rows=$OPTARG ;;
+        *) ;;               # wmenu's styling flags: the bar has its own
+    esac
+done
+
+# A tab in the prompt would split the header (only then is tr worth starting).
+case $prompt in *'	'*) prompt=$(printf '%s' "$prompt" | tr '\t' ' ') ;; esac
+
+out=$(
+    { printf '%s\t%s\t%s\035' "$prompt" "$ci" "$rows"; cat; printf '\035'; } |
+        nc -U "$SOCK" 2>/dev/null
+)
+[ -n "$out" ] || exit 1
+printf '%s\n' "$out"

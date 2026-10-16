@@ -1,0 +1,68 @@
+#!/bin/sh
+# dfmenu-run: wmenu-run, in the bar's picker. Lists every program on $PATH
+# (most recently launched first) and runs the one you pick. Shift+Enter runs
+# exactly what you typed, arguments and all. Extra flags go to dfmenu.
+#
+# The program list comes from a cache, so the menu doesn't wait on a scan of
+# $PATH. The cache is rebuilt in the background after each use, so something
+# installed by a rebuild shows up the time after.
+#
+# Only commands that exist go into the history: a typo doesn't run, doesn't
+# get remembered, and so can't outrank the real program next time. History
+# lines whose program has since disappeared from $PATH are skipped too.
+
+here=${0%/*}
+state=${XDG_STATE_HOME:-$HOME/.local/state}
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/dfmenu-run.list
+hist=$state/dfmenu-run-history
+
+scan() {
+    ( IFS=:; for d in $PATH; do [ -d "$d" ] && ls "$d"; done ) 2>/dev/null |
+        sort -u > "$cache.$$" && mv -f "$cache.$$" "$cache"
+}
+
+[ -d "$state" ] || mkdir -p "$state"
+[ -d "${cache%/*}" ] || mkdir -p "${cache%/*}"
+[ -s "$cache" ] || scan                     # first run: build it now
+
+# The history lines worth keeping, newest first, no repeats: ones whose
+# program is still on $PATH, or that start with a path you typed.
+valid_hist() {
+    awk -v hist="$hist" '
+        BEGIN { while ((getline l < hist) > 0) h[++nh] = l }
+        { have[$0] }
+        END {
+            for (i = 1; i <= nh; i++) {
+                n = split(h[i], w, " ")
+                for (k = 1; k <= n && w[k] ~ /^[A-Za-z_][A-Za-z0-9_]*=/; k++) ;   # skip VAR=value
+                if (k <= n && ((w[k] in have) || w[k] ~ /\//) && !(h[i] in seen)) { seen[h[i]]; print h[i] }
+            }
+        }' "$cache"
+}
+
+cmd=$(
+    { valid_hist; cat "$cache"; } | awk 'NF && !seen[$0]++' |
+        "$here/dfmenu" -i -p launch "$@"
+)
+( scan & )                                  # refresh for next time, detached
+
+[ -n "$cmd" ] || exit 0
+
+# The program is the first word that isn't a VAR=value. Not found: say so
+# (the bar shows it) and stop, without touching the history.
+set -f; set -- $cmd; set +f
+while [ $# -gt 0 ]; do
+    case $1 in [A-Za-z_]*=*) shift ;; *) break ;; esac
+done
+if [ $# -eq 0 ] || ! command -v "$1" >/dev/null 2>&1; then
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send -a launch -h string:x-canonical-private-synchronous:launch \
+            "launch" "${1:-$cmd}: no such program"
+    exit 1
+fi
+
+# Saving rewrites the file from the kept lines, so old typos fall out of it.
+{ printf '%s\n' "$cmd"; valid_hist | grep -vxF -e "$cmd"; } | head -n 30 > "$hist.tmp"
+mv -f "$hist.tmp" "$hist"
+
+exec sh -c "$cmd"
