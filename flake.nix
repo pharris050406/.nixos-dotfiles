@@ -9,7 +9,7 @@
 	};
 
 	outputs={self, nixpkgs, home-manager, ...}:{
-		nixosConfigurations.p-laptop=nixpkgs.lib.nixosSystem{
+		nixosConfigurations.laptop=nixpkgs.lib.nixosSystem{
 			system="x86_64-linux";
 			modules=[
 				./configuration.nix

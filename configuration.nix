@@ -18,7 +18,7 @@
   # Use latest kernel.
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
-  networking.hostName = "p-laptop"; # Define your hostname.
+  networking.hostName = "laptop"; # Define your hostname.
 
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager = {
@@ -66,7 +66,7 @@
 
     ];
   };
-
+	boot.loader.systemd-boot.consoleMode = "0";
   # programs.firefox.enable = true;
   nixpkgs.config.allowUnfree=true;
   environment.systemPackages = with pkgs; [
