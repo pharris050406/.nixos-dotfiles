@@ -106,10 +106,11 @@ vim.keymap.set("n", "<leader>r", function()
   local out  = vim.fn.shellescape(vim.fn.expand("%:p:r"))
   cmd = cmd:gsub("{file}", function() return file end)
            :gsub("{out}",  function() return out end)
-    local root = vim.fs.root(0, "Makefile")
-  if root then
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && make run"
-  end
+local root = vim.fs.root(0, "Makefile")
+if root then
+  local make = vim.fn.executable("direnv") == 1 and "direnv exec . make run" or "make run"
+  cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. make
+end
 
   local src_win = vim.api.nvim_get_current_win()
 

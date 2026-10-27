@@ -18,7 +18,6 @@
 	home.file.".config/nvim".source = ./config-files/nvim;
 	home.file.".config/foot".source = ./config-files/foot;
 	programs.firefox.enable=true;
-
 	home.packages = with pkgs;[
 		ripgrep
 		grim
@@ -38,7 +37,6 @@
 		cloudflared
 		
 		steam
-
 	];
 
 	services.mpd-mpris = {
