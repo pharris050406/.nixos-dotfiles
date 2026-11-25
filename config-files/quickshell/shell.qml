@@ -49,7 +49,7 @@ PanelWindow {
     Binding { target: Events; property: "notify"; value: bar.skyAlerts }
 
     anchors { top: true; left: true; right: true }
-    implicitHeight: pal.fontSize + 21
+    implicitHeight: pal.barHeight                 // Theme.qml: fontSize + barPadding
     color: glass ? Qt.rgba(pal.background.r, pal.background.g, pal.background.b, pal.barOpacity) : pal.background
     WlrLayershell.namespace: "deepfield"
 

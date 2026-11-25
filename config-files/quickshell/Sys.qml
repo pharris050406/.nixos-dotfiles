@@ -81,7 +81,8 @@ Singleton {
             if (total <= 0) return;
             if (avail < 0)                       // pre-3.14 kernels: no MemAvailable
                 avail = Math.max(0, kb("MemFree")) + Math.max(0, kb("Buffers")) + Math.max(0, kb("Cached"));
-            var used = Math.max(0, total - avail);
+            var gpuPool = Math.max(0, kb("GPUReclaim"));   // GPU driver's page pool: reclaimable, but MemAvailable doesn't count it (-1 → 0 on kernels without the field)
+            var used = Math.max(0, total - avail - gpuPool);
             sys.memUsed = used;
             sys.memTotal = total;
             sys.mem = Math.round(100 * used / total);

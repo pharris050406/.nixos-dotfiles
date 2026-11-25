@@ -19,5 +19,11 @@ Item {
     property real barOpacity: 0.85
 
     property string fontFamily: "JetBrainsMono Nerd Font"
-    property int fontSize: 13
+    // Everything in the bar (text, orbits, instruments) scales off fontSize;
+    // it also sizes the cards, notifications, picker and sky labels.
+    property int fontSize: 11
+    // Bar thickness = fontSize + barPadding. Was 13 + 21 = 34 px.
+    // 12 + 16 = 28 is the laptop default; 12 + 14 = 26 and 11 + 13 = 24 still fit.
+    property int barPadding: 10
+    readonly property int barHeight: fontSize + barPadding
 }
