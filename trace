@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# trace — toggle a click-through image overlay (Quickshell layer-shell)
+#
+#   trace                 pick an image with wmenu (toggles off if already running)
+#   trace path/to/img     show that image (swaps it in if already running)
+#   trace -c              use the image on the clipboard
+#   trace more|less|bigger|smaller|left|right|up|down|reset|hide
+#
+# deps: quickshell, wmenu, wl-clipboard
+
+QML="${XDG_CONFIG_HOME:-$HOME/.config}/trace/trace.qml"
+PICK_DIRS=("$HOME/Pictures" "$HOME/Downloads" "$HOME/Documents")
+
+ipc() { quickshell ipc -p "$QML" call trace "$@" >/dev/null 2>&1; }
+running() { pgrep -f "quickshell -p $QML" >/dev/null; }
+
+case "$1" in
+	edit|done|more|less|hide)
+        ipc "$1"; exit ;;
+esac
+
+img=""
+if [[ $1 == -c ]]; then
+    img="${XDG_RUNTIME_DIR:-/tmp}/trace-clip.png"
+    wl-paste --type image/png >"$img" 2>/dev/null || { echo "no image on clipboard" >&2; exit 1; }
+elif [[ -n $1 ]]; then
+    img="$1"
+elif running; then
+    pkill -f "quickshell -p $QML"; exit
+else
+    img=$(find "${PICK_DIRS[@]}" -maxdepth 3 -type f \
+            \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' \) \
+            2>/dev/null | wmenu -l 15 -p trace) || exit
+fi
+
+[[ -f $img ]] || { echo "trace: no such file: $img" >&2; exit 1; }
+img=$(realpath "$img")
+
+if running; then
+    ipc load "$img"
+else
+    TRACE_IMG="$img" setsid -f quickshell -p "$QML" >/dev/null 2>&1
+fi

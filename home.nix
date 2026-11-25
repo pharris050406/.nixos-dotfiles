@@ -1,6 +1,38 @@
-{config, pkgs, ...}:
-
-{
+{config, pkgs, inputs, ...}:
+let
+  dlmusic = pkgs.writeShellApplication {
+    name = "dlmusic";
+    runtimeInputs = with pkgs; [
+      spotdl yt-dlp ffmpeg jq curl mpc python3
+      coreutils findutils gnused
+    ];
+    excludeShellChecks = [ "SC2016" "SC1003" ];
+    text = builtins.readFile ./config-files/sway/scripts/dlmusic;
+  };
+  dotnet = pkgs.dotnetCorePackages.runtime_10_0;
+  ksa = pkgs.buildFHSEnv {
+    name = "ksa";
+    targetPkgs = p: with p; [
+      dotnet
+      vulkan-loader libGL
+      glfw                      # harmless if KSA bundles its own
+      xorg.libX11 xorg.libXcursor xorg.libXrandr xorg.libXi
+      xorg.libXinerama xorg.libXext
+      libxkbcommon wayland
+      icu openssl zlib          # .NET runtime deps
+      alsa-lib libpulseaudio
+      stdenv.cc.cc.lib
+    ];
+    profile = ''
+      export DOTNET_ROOT=${dotnet}/share/dotnet
+      # export XDG_SESSION_TYPE=x11
+    '';
+    runScript = pkgs.writeShellScript "ksa-run" ''
+	  cd "$HOME/Games/ksa/" || exit 1
+	  exec ./KSA "$@"
+	'';
+  };
+in{
 	home.username="p";
 	home.homeDirectory = "/home/p";
 	programs.git.enable=true;
@@ -10,6 +42,7 @@
 		interactiveShellInit=builtins.readFile ./config-files/fish/space.fish;
 		functions={
 			nrs="sudo nixos-rebuild switch --flake ~/.nixos-dotfiles";
+			ncd = "cd ${config.home.homeDirectory}/.nixos-dotfiles";
 		};
 	};
 
@@ -18,30 +51,41 @@
 	home.file.".config/nvim".source = ./config-files/nvim;
 	home.file.".config/foot".source = ./config-files/foot;
 	programs.firefox.enable=true;
+	# add packages
 	home.packages = with pkgs;[
 		ripgrep
 		grim
 		slurp
+		satty
 		btop
 		quickshell
 		mpc
 		rmpc
+		dlmusic
 		ffmpeg
 		swayfx
 		autotiling
 		wmenu
-
+		
+		(writeScriptBin "trace" (builtins.readFile ./trace))
+		(pkgs.callPackage ./blender-luxcore.nix { })
+		(python3.withPackages (ps: with ps; [ numpy scipy pillow ]))
 		wl-clipboard
 		libnotify
 		brightnessctl
 		cloudflared
+
+		imagemagick
 		
+		libreoffice
 		steam
+		ksa
+
 	];
 	home.pointerCursor = {
 	  package = pkgs.adwaita-icon-theme;
 	  name = "Adwaita";
-	  size = 6;
+	  size = 16;
 	  gtk.enable = true;
 	};
 	services.mpd-mpris = {
@@ -77,10 +121,29 @@
 					path = config.xdg.userDirs.music;
 					devices = [ "p-bsd" ];
 				};
+				  "AndroidPlaylists" = {
+					path = "${config.home.homeDirectory}/.android_playlists";
+					devices = [ "p-bsd" ];
+				  };
 			};
 		};
 	};
-
+	
+	# services.easyeffects = {
+	# 	enable = true;
+	# 	preset = "FW13Pro_Raw";
+	# };
+	  xdg.dataFile."easyeffects/output"={
+		source = ./config-files/easyeffects;
+		recursive=true;
+	  };
+   xdg.configFile."trace/trace.qml".source = ./config-files/trace/trace.qml;
+	systemd.user.targets.sway-session.Unit = {
+	  Description = "sway session";
+	  BindsTo = [ "graphical-session.target" ];
+	  Wants = [ "graphical-session-pre.target" ];
+	  After = [ "graphical-session-pre.target" ];
+	};
 	xdg.userDirs = {
 		enable = true;
 		createDirectories = true;

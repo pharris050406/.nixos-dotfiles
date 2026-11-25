@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: dlmusic [-p] [-n NAME] <URL | playlist.csv>
+  Spotify playlist/album/track link  -> spotdl (YouTube Music matching)
+  Exportify .csv export              -> same, but no Spotify API calls at all
+  anything else (YouTube etc.)       -> yt-dlp
+  -p       also write an m3u playlist
+  -n NAME  playlist name (default: Spotify's name; for a CSV, the file name)
+EOF
+    exit 1
+}
+
+MUSIC_DIR="$HOME/Music"
+PLAYLIST_DIR="$MUSIC_DIR/Playlists"
+ANDROID_PL_DIR="$HOME/.android_playlists"
+THREADS="${DLMUSIC_THREADS:-4}"     # spotdl download threads
+VERIFIED=(--only-verified-results)                 # official YouTube Music audio only
+[[ -n ${DLMUSIC_ALLOW_VIDEOS:-} ]] && VERIFIED=()   # DLMUSIC_ALLOW_VIDEOS=1 dlmusic ... to allow video uploads
+PLAYLIST_FLAG=false
+PL_NAME=""
+URL=""
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p) PLAYLIST_FLAG=true; shift ;;
+        -n) [[ $# -ge 2 ]] || usage; PL_NAME="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *)  URL="$1"; shift ;;
+    esac
+done
+[[ -n "$URL" ]] || usage
+
+CSV_FILE=""
+if [[ "$URL" == *.csv ]]; then
+    [[ -f "$URL" ]] || { echo "Error: no such file: $URL" >&2; exit 1; }
+    CSV_FILE=$(realpath "$URL")      # before we cd into ~/Music
+fi
+
+mkdir -p "$PLAYLIST_DIR" "$ANDROID_PL_DIR"
+pushd "$MUSIC_DIR" > /dev/null || exit 1
+
+# ==========================================
+# SPOTIFY LINK / EXPORTIFY CSV (Using spotdl)
+# ==========================================
+# Both build a *complete* .spotdl track list. Because every field spotdl
+# needs is already filled in, spotdl skips its per-song Spotify lookups and
+# goes straight to its YouTube Music matcher (ISRC search, title/artist/
+# album/duration scoring), so missing songs cost zero Spotify API calls.
+if [[ -n "$CSV_FILE" || "$URL" == *"spotify.com"* ]]; then
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+
+    if [[ -n "$CSV_FILE" ]]; then
+        echo "Exportify CSV detected. Reading track list..."
+        basename "$CSV_FILE" .csv > "$tmp/title"
+        python3 - "$CSV_FILE" > "$tmp/list.json" <<'PY'
+import csv, json, re, sys
+
+def col(row, *names):
+    low = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+    for n in names:
+        if low.get(n.lower()):
+            return low[n.lower()]
+    return ""
+
+songs = []
+with open(sys.argv[1], newline="", encoding="utf-8-sig") as f:
+    for row in csv.DictReader(f):
+        uri = col(row, "Track URI", "Spotify ID", "URI")
+        tid = uri.rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+        if not tid or uri.startswith("spotify:local:"):
+            continue
+        artists = [a.strip() for a in col(row, "Artist Name(s)", "Artist Names", "Artist").split(";") if a.strip()]
+        name = col(row, "Track Name", "Name", "Title")
+        if not artists or not name:
+            continue
+        date = col(row, "Release Date", "Album Release Date")
+        try:
+            ms = int(float(col(row, "Duration (ms)", "Track Duration (ms)") or 0))
+        except ValueError:
+            ms = 0
+        genres = [g.strip() for g in re.split(r"[;,]", col(row, "Genres")) if g.strip()]
+        songs.append({
+            "name": name, "artists": artists, "artist": artists[0],
+            "genres": genres, "disc_number": 0, "disc_count": 0,
+            "album_name": col(row, "Album Name", "Album") or name,
+            "album_artist": col(row, "Album Artist Name(s)").split(";")[0].strip() or artists[0],
+            "duration": round(ms / 1000),
+            "year": int(date[:4]) if date[:4].isdigit() else 0, "date": date,
+            "track_number": 0, "tracks_count": 0,   # not in the CSV
+            "song_id": tid, "explicit": col(row, "Explicit").lower() == "true",
+            "publisher": col(row, "Record Label"),
+            "url": f"https://open.spotify.com/track/{tid}",
+            "isrc": col(row, "ISRC") or None,
+            "cover_url": col(row, "Album Image URL") or None,
+            "copyright_text": None, "album_id": "",
+        })
+json.dump(songs, sys.stdout)
+PY
+    else
+        echo "Spotify link detected. Fetching track list..."
+        if [[ "$URL" =~ /(playlist|album|track)/([A-Za-z0-9]+) ]]; then
+            kind=${BASH_REMATCH[1]}; id=${BASH_REMATCH[2]}
+        else
+            echo "Error: only Spotify playlist, album, and track links are supported." >&2
+            exit 1
+        fi
+
+        # ---- Spotify Web API, using the same credentials spotdl uses ----
+        SPOTDL_CFG="$HOME/.spotdl/config.json"
+        CLIENT_ID=$(jq -r '.client_id // empty' "$SPOTDL_CFG" 2>/dev/null || true)
+        CLIENT_SECRET=$(jq -r '.client_secret // empty' "$SPOTDL_CFG" 2>/dev/null || true)
+        CLIENT_ID=${CLIENT_ID:-5f573c9620494bae87890c0f08a60293}         # spotdl defaults
+        CLIENT_SECRET=${CLIENT_SECRET:-212476d9b0f3472eaa762d90b19b0ba8}
+
+        # If you've logged in with `spotdl --user-auth`, reuse that token (needed to
+        # read your own playlists with a new dev-mode app); else app-only token.
+        SPOTIPY_CACHE="$HOME/.spotdl/.spotipy"
+        get_token() {
+            local now resp
+            now=$(date +%s)
+            if [[ -f $SPOTIPY_CACHE ]] && jq -e '.refresh_token' "$SPOTIPY_CACHE" >/dev/null 2>&1; then
+                if (( $(jq -r '.expires_at // 0' "$SPOTIPY_CACHE") > now + 60 )); then
+                    jq -r .access_token "$SPOTIPY_CACHE"; return
+                fi
+                resp=$(curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=refresh_token \
+                    --data-urlencode "refresh_token=$(jq -r .refresh_token "$SPOTIPY_CACHE")" \
+                    https://accounts.spotify.com/api/token) || return 1
+                # write the refreshed token back so spotdl stays in sync
+                jq --argjson r "$resp" --argjson now "$now" \
+                    '. + $r + {expires_at: ($now + $r.expires_in)}' "$SPOTIPY_CACHE" \
+                    > "$SPOTIPY_CACHE.tmp" && mv "$SPOTIPY_CACHE.tmp" "$SPOTIPY_CACHE"
+                jq -r .access_token <<<"$resp"; return
+            fi
+            curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials \
+                https://accounts.spotify.com/api/token | jq -r .access_token
+        }
+        TOKEN=$(get_token) || { echo "Error: Spotify auth failed." >&2; exit 1; }
+
+        # Returns 0 + JSON on success, 2 on a long rate limit, 1 otherwise.
+        # Short 429s (<=30s) are waited out; long ones fail fast.
+        api() {
+            local out code ra tries=0
+            while :; do
+                out=$(curl -sS -o "$tmp/body" -w '%{http_code} %header{retry-after}' \
+                    -H "Authorization: Bearer $TOKEN" "https://api.spotify.com/v1/$1") || return 1
+                code=${out%% *}; ra=${out#* }; ra=${ra:-1}
+                case $code in
+                    2??) cat "$tmp/body"; return 0 ;;
+                    429)
+                        if (( ra <= 30 && tries++ < 5 )); then sleep "$ra"; continue; fi
+                        echo "Error: Spotify rate limit for this client ID; retry in ${ra}s (~$(( (ra + 3599) / 3600 ))h)." >&2
+                        echo "       Workaround: export the playlist as CSV at https://exportify.net" >&2
+                        echo "       and run: dlmusic -p <file>.csv   (uses no Spotify API calls)" >&2
+                        return 2 ;;
+                    *)  [[ -n ${2:-} ]] || echo "Error: Spotify API returned HTTP $code for $1" >&2
+                        return 1 ;;
+                esac
+            done
+        }
+
+        # Track object -> complete spotdl Song
+        JQ_SONG='
+        def song($alb): {
+            name, artists: [.artists[].name], artist: .artists[0].name, genres: [],
+            disc_number: (.disc_number // 1), disc_count: (.disc_number // 1),
+            album_name: $alb.name, album_artist: ($alb.artists[0].name // .artists[0].name),
+            duration: ((.duration_ms // 0) / 1000 | round),
+            year: (($alb.release_date // "")[:4] | tonumber? // 0),
+            date: ($alb.release_date // ""),
+            track_number: (.track_number // 0), tracks_count: ($alb.total_tracks // 0),
+            song_id: .id, explicit: (.explicit // false), publisher: "",
+            url: .external_urls.spotify, isrc: (.external_ids.isrc // null),
+            cover_url: ($alb.images[0].url // null), copyright_text: null,
+            album_id: ($alb.id // "")
+        };'
+
+        fetch_playlist() {
+            local page rc off=0 ep=items
+            api "playlists/$id?fields=name" | jq -r .name > "$tmp/title"
+            while :; do
+                # Feb 2026 API renamed /tracks -> /items; try new, fall back to old
+                page=$(api "playlists/$id/$ep?limit=100&offset=$off" quiet) && rc=0 || rc=$?
+                if (( rc == 2 )); then return 2; fi
+                if (( rc != 0 )); then
+                    if [[ $ep == items && $off == 0 ]]; then ep=tracks; continue; fi
+                    echo "Error: couldn't read this playlist's tracks. New dev-mode Spotify apps" >&2
+                    echo "       can only read playlists you own/collaborate on, after spotdl --user-auth." >&2
+                    return 1
+                fi
+                printf '%s\n' "$page" >> "$tmp/pages"
+                [[ -n $(jq -r '.next // empty' <<<"$page") ]] || break
+                off=$((off + 100))
+            done
+            jq -s "$JQ_SONG"'
+                [.[].items[] | (.item // .track)
+                 | select(. != null and .type == "track" and .external_urls.spotify != null)
+                 | song(.album)]' "$tmp/pages"
+        }
+
+        fetch_album() {
+            local alb page off=50
+            alb=$(api "albums/$id")
+            jq -r .name <<<"$alb" > "$tmp/title"
+            jq '.tracks' <<<"$alb" > "$tmp/pages"
+            page=$alb
+            while [[ -n $(jq -r '(.tracks // .).next // empty' <<<"$page") ]]; do
+                page=$(api "albums/$id/tracks?limit=50&offset=$off")
+                printf '%s\n' "$page" >> "$tmp/pages"
+                off=$((off + 50))
+            done
+            jq -s --argjson alb "$(jq 'del(.tracks)' <<<"$alb")" "$JQ_SONG"'
+                [.[].items[] | song($alb)]' "$tmp/pages"
+        }
+
+        fetch_track() {
+            local t
+            t=$(api "tracks/$id")
+            jq -r .name <<<"$t" > "$tmp/title"
+            jq "$JQ_SONG"'[song(.album)]' <<<"$t"
+        }
+
+        "fetch_$kind" > "$tmp/list.json"
+    fi
+
+    # Match songs to files by Artist/Album/Title, ignoring case and punctuation,
+    # so spotdl's filename sanitizing (":" -> "-", dropped "/?*" etc.) doesn't
+    # cause false misses. Adds a .path field to every song (null = not on disk).
+    JQ_RESOLVE='
+    def norm: ascii_downcase | explode
+        | map(select((. >= 48 and . <= 57) or (. >= 97 and . <= 122) or . > 127))
+        | implode;
+    def songkey:
+        "\(.artists[0] // "" | norm)/\(.album_name // "" | norm)/\(.name // "" | norm)";
+    ($files | split("\n") | map(
+        ltrimstr("./") | . as $p | split("/") | select(length == 3)
+        | {key: "\(.[0] | norm)/\(.[1] | norm)/\(.[2] | .[:rindex(".")] | norm)", value: $p}
+      ) | from_entries) as $have
+    | map(. + {path: $have[songkey]})
+    '
+
+    resolve() {
+        find . -mindepth 3 -maxdepth 3 -type f ! -name '.*' \
+            \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.opus' \
+               -o -iname '*.m4a' -o -iname '*.ogg' \) > "$tmp/files"
+        jq --rawfile files "$tmp/files" "$JQ_RESOLVE" \
+            "$tmp/list.json" > "$tmp/resolved.json"
+    }
+
+    resolve
+    jq '[.[] | select(.path == null) | del(.path)] | unique_by(.url)' \
+        "$tmp/resolved.json" > "$tmp/missing.spotdl"
+
+    # Manual matches, one per line in ~/.config/dlmusic/links:
+    #   <YouTube / YouTube Music link>  <Artist - Title, as dlmusic prints it>
+    # Links you type at the prompt below are saved here automatically.
+    LINKS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dlmusic/links"
+    if [[ -f "$LINKS_FILE" ]]; then
+        jq --rawfile links "$LINKS_FILE" '
+            def norm: ascii_downcase | explode
+                | map(select((. >= 48 and . <= 57) or (. >= 97 and . <= 122) or . > 127))
+                | implode;
+            ($links | split("\n") | map(
+                sub("^\\s+"; "") | select(length > 0 and (startswith("#") | not))
+                | capture("^(?<url>\\S+)\\s+(?<name>.+)$")?
+                | {key: (.name | norm), value: .url}) | from_entries) as $ov
+            | map(($ov[(.artists[0] + .name) | norm]) as $u
+                  | if $u then . + {download_url: $u} else . end)' \
+            "$tmp/missing.spotdl" > "$tmp/missing.tmp" && mv "$tmp/missing.tmp" "$tmp/missing.spotdl"
+    fi
+
+    total=$(jq length "$tmp/resolved.json")
+    n_missing=$(jq length "$tmp/missing.spotdl")
+    echo "$((total - n_missing))/$total already in library, $n_missing to download."
+    n_links=$(jq '[.[] | select(.download_url != null)] | length' "$tmp/missing.spotdl")
+    if (( n_links > 0 )); then echo "Using $n_links manual link(s) from $LINKS_FILE"; fi
+
+    # Art isn't embedded; cover.jpg is fetched directly below.
+    SPOTDL_ARGS=(
+        --format opus
+        --bitrate disable
+        "${VERIFIED[@]}"
+        --output "{artist}/{album}/{title}.{output-ext}"
+        --skip-album-art
+        --threads "$THREADS"
+    )
+
+    # Background spotdl: plain one-line-per-message log, never reads the terminal
+    run_spotdl_bg() {   # $1 = .spotdl file, $2 = log file
+        NO_COLOR=1 COLUMNS=10000 spotdl download "$1" "${SPOTDL_ARGS[@]}" --simple-tui \
+            </dev/null >>"$2" 2>&1
+    }
+
+    if (( n_missing > 0 )); then
+        if [[ -t 0 && -t 1 && -z ${DLMUSIC_NO_PROMPT:-} ]]; then
+            # Interactive: downloads run in the background; whenever spotdl
+            # can't find an official match, ask for a link right here and
+            # start that download too, while the rest keep going.
+            mkdir -p "$(dirname "$LINKS_FILE")"
+            echo "Downloading in the background. If a song has no official match,"
+            echo "you'll be asked for a link (Enter skips)."
+            : > "$tmp/spotdl.log"   # must exist before tail starts watching it
+            run_spotdl_bg "$tmp/missing.spotdl" "$tmp/spotdl.log" &
+            spid=$!
+
+            tail -n +1 -f --pid="$spid" "$tmp/spotdl.log" 2>/dev/null \
+            | grep --line-buffered -o 'No results found for song: .*' \
+            | sed -u -e 's/^No results found for song: //' -e 's/[[:space:]]*$//' \
+            | {
+                n=0
+                while IFS= read -r name; do
+                    jq --arg n "$name" '[.[] | select((.artist + " - " + .name) == $n)][:1]' \
+                        "$tmp/missing.spotdl" > "$tmp/one.json"
+                    [[ $(jq length "$tmp/one.json") == 1 ]] || continue
+                    q=$(jq -r '.[0] | "\(.artist) \(.name)" | @uri' "$tmp/one.json")
+                    dur=$(jq -r '.[0].duration | (. % 60 | tostring) as $s
+                        | "\(. / 60 | floor):\(if ($s | length) < 2 then "0" + $s else $s end)"' "$tmp/one.json")
+                    ndone=$(cat "$tmp"/*.log 2>/dev/null | grep -c 'Downloaded "' || true)
+                    printf '\n\e[1mNo official match:\e[0m %s  (%s)   [%s downloaded so far]\n' "$name" "$dur" "$ndone"
+                    printf '  search: https://music.youtube.com/search?q=%s\n' "$q"
+                    read -e -r -p "  link (Enter to skip): " link </dev/tty || link=""
+                    if [[ $link != http* ]]; then echo "  skipped"; continue; fi
+                    n=$((n + 1))
+                    jq --arg u "$link" '.[0].download_url = $u' "$tmp/one.json" > "$tmp/manual-$n.spotdl"
+                    printf '%s\t%s\n' "$link" "$name" >> "$LINKS_FILE"
+                    run_spotdl_bg "$tmp/manual-$n.spotdl" "$tmp/manual-$n.log" &
+                    echo "  downloading in the background (saved to $LINKS_FILE)"
+                done
+                if (( n > 0 )); then echo; echo "Waiting for $n manual download(s)..."; fi
+                wait    # manual downloads were started in this subshell
+            } || true
+
+            wait "$spid" || echo "WARN: spotdl exited with errors; log was $tmp/spotdl.log" >&2
+        else
+            spotdl download "$tmp/missing.spotdl" "${SPOTDL_ARGS[@]}" \
+                || echo "WARN: spotdl exited with errors; continuing." >&2
+        fi
+        resolve
+    fi
+
+    # cover.jpg for every album dir in this list that lacks one (also
+    # backfills old albums). Spotify's cover URL if we have it, else look
+    # it up via oEmbed (public, not part of the rate-limited Web API).
+    # Every download is checked to really be an image before it's kept.
+    is_image() {
+        local magic
+        magic=$(head -c 3 "$1" | od -An -tx1 | tr -d ' \n')
+        [[ $magic == ffd8ff || $magic == 89504e ]]    # JPEG or PNG
+    }
+
+    jq -r '[.[] | select(.path != null)
+             | {dir: (.path | sub("/[^/]*$"; "")), cover: (.cover_url // ""), url}]
+           | unique_by(.dir)[] | [.dir, .cover, .url] | join("\u001f")' "$tmp/resolved.json" |
+    # \x1f separator, not tabs: bash merges consecutive tabs, which shifted
+    # fields whenever the cover URL was empty
+    while IFS=$'\x1f' read -r dir cover track_url; do
+        [[ -f "$dir/cover.jpg" ]] && continue
+        urls=()
+        if [[ -n $cover ]]; then
+            urls+=("$cover")
+        else
+            thumb=$(curl -fsS --get --data-urlencode "url=$track_url" \
+                https://open.spotify.com/oembed </dev/null 2>/dev/null \
+                | jq -r '.thumbnail_url // empty') || true
+            # try the 640px variant first, then the URL exactly as given
+            [[ -n $thumb ]] && urls+=("${thumb/ab67616d00001e02/ab67616d0000b273}" "$thumb")
+        fi
+        got=false
+        for u in "${urls[@]}"; do
+            if curl -fsSL -o "$dir/.cover.tmp" "$u" </dev/null 2>/dev/null \
+               && is_image "$dir/.cover.tmp"; then
+                mv "$dir/.cover.tmp" "$dir/cover.jpg"; got=true; break
+            fi
+        done
+        rm -f "$dir/.cover.tmp"
+        if $got; then
+            echo "Cover: $dir"
+        else
+            echo "WARN: no cover for $dir (tried: ${urls[*]:-nothing})" >&2
+        fi
+    done
+
+    if $PLAYLIST_FLAG; then
+        PL_TITLE=${PL_NAME:-$(cat "$tmp/title" 2>/dev/null || true)}
+        PL_TITLE="${PL_TITLE:-Unknown}"
+
+        RAW_M3U="$PLAYLIST_DIR/${PL_TITLE//\//-}.m3u"
+        CLEAN_PL_TITLE=$(printf '%s' "$PL_TITLE" | tr '/:*?"<>|\\' '-')
+        CLEAN_M3U="$ANDROID_PL_DIR/$CLEAN_PL_TITLE.m3u8"
+
+        # Built straight from the track list: keeps Spotify's order and
+        # includes songs that were already downloaded.
+        {
+            echo "#EXTM3U"
+            echo "#PLAYLIST:$PL_TITLE"
+            jq -r '.[] | select(.path != null)
+                   | "#EXTINF:\(.duration // -1),\(.artists[0]) - \(.name)",
+                     "../\(.path)"' "$tmp/resolved.json"
+        } > "$RAW_M3U"
+
+        cp "$RAW_M3U" "$CLEAN_M3U"
+        echo "Successfully created playlist: ${RAW_M3U##*/}"
+    fi
+
+    jq -r '.[] | select(.path == null) | "  \(.artists[0]) - \(.name)"' \
+        "$tmp/resolved.json" | sort -u > "$tmp/notfound"
+    if [[ -s "$tmp/notfound" ]]; then
+        echo "WARN: $(wc -l < "$tmp/notfound") track(s) could not be downloaded:" >&2
+        cat "$tmp/notfound" >&2
+    fi
+
+# ==========================================
+# STANDARD URL HANDLING (Using yt-dlp)
+# ==========================================
+else
+    echo "Standard link detected. Utilizing yt-dlp..."
+
+    PLAYLIST_ARGS=()
+    if $PLAYLIST_FLAG; then
+        PL_TITLE=$(yt-dlp --flat-playlist --playlist-items 1 \
+            --print "%(playlist_title|Unknown)s" "$URL" 2>/dev/null | head -n1)
+        PL_TITLE="${PL_TITLE:-Unknown}"
+
+        RAW_M3U="$PLAYLIST_DIR/$PL_TITLE.m3u"
+        CLEAN_PL_TITLE=$(echo "$PL_TITLE" | tr '/:*?"<>|\\' '-')
+        CLEAN_M3U="$ANDROID_PL_DIR/$CLEAN_PL_TITLE.m3u8"
+
+        # Write extended M3U headers
+        {
+            echo "#EXTM3U"
+            echo "#PLAYLIST:$PL_TITLE"
+        } > "$RAW_M3U"
+
+        PLAYLIST_ARGS+=(
+            --no-simulate
+            --print-to-file
+			"video:../%(artist,uploader|Unknown)s/%(album,playlist_title|Unknown)s/%(title)s.opus"
+            "$RAW_M3U"
+        )
+    fi
+
+    yt-dlp -x \
+        --audio-format opus \
+        --audio-quality 0 \
+        --embed-metadata \
+        --convert-thumbnails jpg \
+        --ppa "ThumbnailsConvertor:-vf crop=ih:ih" \
+        --output-na-placeholder "Unknown" \
+        --add-metadata \
+        --replace-in-metadata "artist" "(?i)(?: feat\.?| ft\.?| &| with| and|,) .*" "" \
+        --replace-in-metadata "uploader" "(?i)(?: - Topic| feat\.?| ft\.?| &| with| and|,) .*" "" \
+        -o "%(artist,uploader|Unknown)s/%(album,playlist_title|Unknown)s/%(title)s.%(ext)s" \
+        --no-overwrites \
+        --write-thumbnail \
+        -o "thumbnail:%(artist,uploader|Unknown)s/%(album,playlist_title|Unknown)s/cover.%(ext)s" \
+        --exec "f=%(filepath)q; rm -f \"\${f%.*}.jpg\"" \
+        "${PLAYLIST_ARGS[@]}" \
+        "$URL"
+
+    # Copy the populated raw M3U to the sanitized android folder
+    if $PLAYLIST_FLAG && [ -f "$RAW_M3U" ]; then
+        cp "$RAW_M3U" "$CLEAN_M3U"
+        echo "Successfully created playlist: $PL_TITLE.m3u"
+    fi
+fi
+
+popd > /dev/null
+mpc -q update || echo "WARN: mpc update failed (is mpd running?)" >&2
