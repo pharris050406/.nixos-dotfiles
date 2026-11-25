@@ -1,8 +1,7 @@
 { config, lib, pkgs, ... }:{
   imports =
     [
-      ./hardware-configuration.nix
-	  ./speaker-eq.nix
+
     ];
   hardware.graphics={
 	enable=true;
@@ -18,8 +17,6 @@
 
   # Use latest kernel.
   boot.kernelPackages = pkgs.linuxPackages_latest;
-
-  networking.hostName = "laptop"; # Define your hostname.
 
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager = {
