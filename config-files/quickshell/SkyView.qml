@@ -43,16 +43,27 @@ Item {
     readonly property color label: Lib.mix(theme.foreground, theme.muted, 0.5)
     readonly property string fontCss: "'" + theme.fontFamily + "', monospace"
 
+    // Canvas renders at the screen's device pixel ratio. The soft layers (sky
+    // gradient, twilight, Milky Way haze) gain nothing from that, so they're
+    // drawn at a fixed resolution in *logical* pixels and scaled up: at 2x
+    // that's a quarter of the pixels. Only the main layer (stars, text) is sharp.
+    property real dpr: Screen.devicePixelRatio > 0 ? Screen.devicePixelRatio : 1
+
     // ---------------- static catalog, prepared once ----------------
+    // Stars and grain are sorted by color, so a paint sets each color once and
+    // varies only globalAlpha per point (a number), instead of building and
+    // parsing an rgba() string for every one of ~13,000 points.
     property var cat: null
+    readonly property int extN: 2048
     Component.onCompleted: {
         var st = SD.STARS, n = st.length / 4, stars = [];
         for (var i = 0; i < n; i++) {
             var hex = Lib.blackbody(SM.bvToKelvin(st[4 * i + 3]));
             var c = parseInt(hex.slice(1), 16);
-            stars.push({ v: SM.vec(st[4 * i], st[4 * i + 1]), mag: st[4 * i + 2],
+            stars.push({ v: SM.vec(st[4 * i], st[4 * i + 1]), mag: st[4 * i + 2], bv: st[4 * i + 3], hex: hex,
                          rgb: "rgba(" + (c >> 16 & 255) + "," + (c >> 8 & 255) + "," + (c & 255) + "," });
         }
+        stars.sort((x, y) => x.bv - y.bv);
         var mw = [];
         for (var j = 0; j < SD.MILKY.length; j += 3)
             mw.push({ v: SM.vec(SD.MILKY[j], SD.MILKY[j + 1]), lv: SD.MILKY[j + 2] });
@@ -65,7 +76,8 @@ Item {
             var T = SM.bvToKelvin(s[4]);
             return { v: SM.vec(s[0], s[1]), mag: s[2], name: s[3], bv: s[4], kelvin: T };
         });
-        var labels = SD.LABELS.map(l => ({ v: SM.vec(l[0], l[1]), name: l[2] }));
+        var labels = SD.LABELS.map(l => ({ v: SM.vec(l[0], l[1]), name: l[2],
+                                            spaced: l[2].toUpperCase().split("").join(" ") }));
         // Unresolved starlight: a fixed, seeded scatter of faint points inside
         // the Milky Way, denser in the brighter levels. This grain carries the
         // structure; the haze under it stays faint.
@@ -75,16 +87,20 @@ Item {
             var dra = SD.MILKY[q], ddec = SD.MILKY[q + 1], lvl = SD.MILKY[q + 2];
             var cosd = Math.max(0.15, Math.cos(ddec * SM.D2R));
             for (var u = 0; u < per[lvl]; u++) {
-                var hx = Lib.blackbody(3200 + 7000 * Math.pow(rnd(), 1.6));
-                var cn = parseInt(hx.slice(1), 16);
+                // 100 K steps: invisible on a 1 px grain, and ~70 colors instead of ~8,000
+                var hx = Lib.blackbody(Math.round((3200 + 7000 * Math.pow(rnd(), 1.6)) / 100) * 100);
                 dust.push({
                     v: SM.vec(dra + (rnd() - 0.5) * 2 * half / cosd, ddec + (rnd() - 0.5) * 2 * half),
                     a: 0.06 + 0.035 * lvl * rnd(),
-                    rgb: "rgba(" + (cn >> 16 & 255) + "," + (cn >> 8 & 255) + "," + (cn & 255) + ","
+                    hex: hx
                 });
             }
         }
-        cat = { stars: stars, mw: mw, dust: dust, lines: lines, named: named, labels: labels };
+        dust.sort((x, y) => x.hex < y.hex ? -1 : x.hex > y.hex ? 1 : 0);
+        // extinction by sin(altitude), so the per-star loop skips asin + pow
+        var ext = new Float64Array(extN + 1);
+        for (var e = 0; e <= extN; e++) ext[e] = extinction(Math.asin(e / extN));
+        cat = { stars: stars, mw: mw, dust: dust, lines: lines, named: named, labels: labels, ext: ext };
         almanac();
         redraw();
         if (meteors) scheduleMeteor();
@@ -131,7 +147,27 @@ Item {
     }
 
     function redraw() { Qt.callLater(paintAll); }
-    function paintAll() { base.requestPaint(); archGlow.requestPaint(); antiGlow.requestPaint(); milky.requestPaint(); main.requestPaint(); }
+    // The twilight layers are blank most of the time; a blank one that stays
+    // blank isn't repainted (each repaint is a texture upload).
+    property bool archLit: true
+    property bool antiLit: true
+    function paintAll() {
+        paintHud();
+        base.requestPaint();
+        milky.requestPaint();
+        main.requestPaint();
+        if (cat) {
+            var tw = twilightState(frame(width, height));
+            var arch = tw.warm > 0 || tw.deep > 0, anti = tw.belt > 0;
+            if (arch || archLit) archGlow.requestPaint();
+            if (anti || antiLit) antiGlow.requestPaint();
+            archLit = arch;
+            antiLit = anti;
+        } else {
+            archGlow.requestPaint();
+            antiGlow.requestPaint();
+        }
+    }
     onFacingChanged: redraw()
     onFovChanged: redraw()
     onOffsetMinChanged: redraw()
@@ -140,22 +176,45 @@ Item {
     onLongitudeChanged: { if (cat) almanac(); redraw(); }
     onWidthChanged: redraw()
     onHeightChanged: redraw()
-    onThemeChanged: redraw()
+    onThemeChanged: { hudKey = ""; redraw(); }
+    onDprChanged: redraw()
 
     // ---------------- per-frame geometry ----------------
     // Keep the horizon at 88% of the height whatever the field of view.
-    function frame(W, H) {
+    // The astronomy depends only on the time and place, so it's worked out
+    // once per time step and shared by every layer (turning/zooming reuse it).
+    property var astroCache: null
+    function astro() {
+        var key = (nowMs + offsetMin * 60000) + "|" + latitude + "|" + longitude;
+        if (astroCache && astroCache.key === key) return astroCache;
         var jd = SM.julian(nowMs + offsetMin * 60000);
         var Hz = SM.horizon(jd, latitude, longitude);
         var A = SM.mm(Hz, SM.precession(jd));
-        var S = (W / 2) / (2 * Math.tan(fov * SM.D2R / 4));
-        var centerAlt = 2 * Math.atan(0.19 * H / S) / SM.D2R;
-        var pr = SM.projector(facing, centerAlt, fov, W, H, 0.5);
         var bodies = SM.planets(jd, SD.PLANETS).map(b => Object.assign(b, { w: SM.mul(A, b.v) }));
         var sun = bodies.find(b => b.key === "sun");
         var mo = SM.moon(jd, latitude, longitude);
-        return { jd: jd, A: A, Hz: Hz, pr: pr, S: S, bodies: bodies, sun: sun,
-                 moon: { w: SM.mul(Hz, mo.v), distKm: mo.distKm } };
+        astroCache = { key: key, jd: jd, A: A, Hz: Hz, bodies: bodies, sun: sun,
+                       moon: { w: SM.mul(Hz, mo.v), distKm: mo.distKm } };
+        return astroCache;
+    }
+    function frame(W, H) {
+        var a = astro();
+        var S = (W / 2) / (2 * Math.tan(fov * SM.D2R / 4));
+        var centerAlt = 2 * Math.atan(0.19 * H / S) / SM.D2R;
+        var pr = SM.projector(facing, centerAlt, fov, W, H, 0.5);
+        return { jd: a.jd, A: a.A, Hz: a.Hz, pr: pr, S: S, bodies: a.bodies, sun: a.sun, moon: a.moon };
+    }
+    // The projection folded into the catalog->horizon matrix: screen right/up/
+    // forward and altitude straight from a J2000 vector, no temporary arrays.
+    // For catalog vector v:  z = sin(alt) = Z·v,  d = F·v (null if < −0.3),
+    // x = cx + 2S/(1+d) · R·v,  y = cy − 2S/(1+d) · U·v   (same as pr.project)
+    function sight(f) {
+        var A = f.A, pr = f.pr;
+        var row = u => [u[0] * A[0] + u[1] * A[3] + u[2] * A[6],
+                        u[0] * A[1] + u[1] * A[4] + u[2] * A[7],
+                        u[0] * A[2] + u[1] * A[5] + u[2] * A[8]];
+        return { R: row(pr.right), U: row(pr.up), F: row(pr.f), Z: [A[6], A[7], A[8]],
+                 S2: 2 * pr.scale, cx: pr.cx, cy: pr.cy };
     }
 
     function onScreen(p, W, H, m) { return p && p[0] > -m && p[0] < W + m && p[1] > -m && p[1] < H + m; }
@@ -213,12 +272,19 @@ Item {
     // ================= layer 1: sky gradient, twilight, airglow =================
     Canvas {
         id: base
-        anchors.fill: parent
+        // nothing but smooth gradients: half resolution (in logical pixels) is plenty
+        readonly property real kk: 2 * root.dpr
+        width: Math.ceil(root.width / kk)
+        height: Math.ceil(root.height / kk)
+        scale: kk
+        transformOrigin: Item.TopLeft
+        smooth: true
         onPaint: {
             var ctx = getContext("2d");
             ctx.reset();
             if (!root.cat) return;
-            var W = width, H = height, f = root.frame(W, H), t = root.theme;
+            ctx.scale(1 / kk, 1 / kk);                  // draw in the view's own coordinates
+            var W = root.width, H = root.height, f = root.frame(W, H), t = root.theme;
             var hp = f.pr.project(SM.enu(0, root.facing)), hy = hp ? hp[1] : H * 0.88;
 
             // Night: the theme's background, a little lighter toward the horizon.
@@ -438,7 +504,7 @@ Item {
     Item {
         id: twilight
         anchors.fill: parent
-        readonly property int k: 4
+        readonly property real k: 4 * root.dpr
         Canvas {                                          // the arch, under the Sun
             id: archGlow
             width: Math.ceil(root.width / twilight.k)
@@ -526,7 +592,7 @@ Item {
     // and the whole layer is faded by 1/gain when composited.
     Canvas {
         id: milky
-        readonly property int k: 3
+        readonly property real k: 3 * root.dpr
         readonly property real gain: 6
         width: Math.ceil(parent.width / k)
         height: Math.ceil(parent.height / k)
@@ -559,21 +625,31 @@ Item {
             if (dark <= 0) return;
             var alpha = [0, 0.007, 0.014, 0.022, 0.032, 0.042].map(x => x * milky.gain * dark);
             var step = SD.MILKY_STEP * SM.D2R;
+            var M = root.sight(f), R = M.R, U = M.U, F = M.F, Z = M.Z, S2 = M.S2, cx = M.cx, cy = M.cy;
+            var ext = c.ext, extN = root.extN;
             for (var i = 0; i < c.mw.length; i++) {
-                var w = SM.mul(f.A, c.mw[i].v);
-                if (w[2] < -0.03) continue;
-                var p = f.pr.project(w);
-                if (!root.onScreen(p, W, H, 4)) continue;
+                var v = c.mw[i].v, v0 = v[0], v1 = v[1], v2 = v[2];
+                var z = Z[0] * v0 + Z[1] * v1 + Z[2] * v2;
+                if (z < -0.03) continue;
+                var d = F[0] * v0 + F[1] * v1 + F[2] * v2;
+                if (d < -0.3) continue;
+                var kk = S2 / (1 + d);
+                var px = cx + kk * (R[0] * v0 + R[1] * v1 + R[2] * v2);
+                var py = cy - kk * (U[0] * v0 + U[1] * v1 + U[2] * v2);
+                if (px <= -4 || px >= W + 4 || py <= -4 || py >= H + 4) continue;
                 // soft-edged blobs, overlapping heavily, so the sampling grid never shows
-                var r = Math.max(1.5, 2 / (1 + p[2]) * f.S * step * 2.0);
-                var a = alpha[c.mw[i].lv] * Math.max(0, 1 - root.extinction(Math.asin(w[2])) / 1.2);
+                var r = Math.max(1.5, kk * step * 2.0);
+                // the horizon fade in 12 steps: Qt builds a color table per gradient
+                // and caches it by its stops, so repeated alphas cost nothing
+                var fade = Math.max(0, 1 - ext[z > 0 ? Math.round(z * extN) : 0] / 1.2);
+                var a = alpha[c.mw[i].lv] * Math.round(fade * 12) / 12;
                 if (a <= 0.0005) continue;
-                var gr = ctx.createRadialGradient(p[0], p[1], 0, p[0], p[1], r);
+                var gr = ctx.createRadialGradient(px, py, 0, px, py, r);
                 var rgb = rgbs[c.mw[i].lv];
                 gr.addColorStop(0, rgb + a.toFixed(4) + ")");
                 gr.addColorStop(1, rgb + "0)");
                 ctx.fillStyle = gr;
-                ctx.fillRect(p[0] - r, p[1] - r, 2 * r, 2 * r);
+                ctx.fillRect(px - r, py - r, 2 * r, 2 * r);
             }
         }
     }
@@ -590,24 +666,44 @@ Item {
             if (!root.cat) return;
             var W = width, H = height, f = root.frame(W, H), c = root.cat, t = root.theme;
             var hits = [];
-            var font = function (px, extra) { ctx.font = (extra ? extra + " " : "") + px + "px " + root.fontCss; };
+            // Labels are real Text items laid over the canvas (see labelPool):
+            // Canvas fillText turns every glyph into a path and fills it, with no
+            // glyph cache, which was a third of this layer's time on a 2x screen.
+            var labs = [];
+            var label = function (text, x, y, px, color, alpha, bold, center) {
+                labs.push({ t: text, x: x, y: y, px: px, c: color, a: alpha, b: !!bold, ctr: !!center });
+            };
             var L = root.skyLight(f), mwDark = Math.max(0, Math.min(1, (L.lim - 4.6) / 1.4));
+            var M = root.sight(f), MR = M.R, MU = M.U, MF = M.F, MZ = M.Z, S2 = M.S2, mcx = M.cx, mcy = M.cy;
+            var ext = c.ext, extN = root.extN, lastFill = "";
 
             // ---- Milky Way grain ----
-            for (var di = 0; di < c.dust.length; di++) {
-                var dd = c.dust[di], dw = SM.mul(f.A, dd.v);
-                if (dw[2] < 0.01) continue;
-                var dp = f.pr.project(dw);
-                if (!root.onScreen(dp, W, H, 2)) continue;
-                var da = dd.a * mwDark * Math.max(0, 1 - root.extinction(Math.asin(dw[2])) / 1.5);
-                if (da < 0.01) continue;
-                ctx.fillStyle = dd.rgb + da.toFixed(3) + ")";
-                ctx.fillRect(dp[0], dp[1], 1, 1);
+            if (mwDark > 0) {
+                for (var di = 0; di < c.dust.length; di++) {
+                    var dd = c.dust[di], dv = dd.v, d0 = dv[0], d1 = dv[1], d2 = dv[2];
+                    var dz = MZ[0] * d0 + MZ[1] * d1 + MZ[2] * d2;
+                    if (dz < 0.01) continue;
+                    var dfw = MF[0] * d0 + MF[1] * d1 + MF[2] * d2;
+                    if (dfw < -0.3) continue;
+                    var dk = S2 / (1 + dfw);
+                    var dx = mcx + dk * (MR[0] * d0 + MR[1] * d1 + MR[2] * d2);
+                    var dy = mcy - dk * (MU[0] * d0 + MU[1] * d1 + MU[2] * d2);
+                    if (dx <= -2 || dx >= W + 2 || dy <= -2 || dy >= H + 2) continue;
+                    var da = dd.a * mwDark * Math.max(0, 1 - ext[Math.round(dz * extN)] / 1.5);
+                    if (da < 0.01) continue;
+                    if (dd.hex !== lastFill) { ctx.fillStyle = dd.hex; lastFill = dd.hex; }
+                    ctx.globalAlpha = da;
+                    ctx.fillRect(dx, dy, 1, 1);
+                }
+                ctx.globalAlpha = 1;
             }
 
             // ---- constellation figures ----
-            ctx.lineWidth = 1;
-            ctx.strokeStyle = Lib.css(t.accent2, 0.22 * L.figures);
+            // One *physical* pixel wide, with the alpha scaled to match: the same
+            // ink as a 1 px line at 1x, but it stays on Qt's fast path for thin
+            // lines (a 2 px line on a 2x screen is stroked as a polygon, ~15 ms).
+            ctx.lineWidth = 1 / root.dpr;
+            ctx.strokeStyle = Lib.css(t.accent2, Math.min(1, 0.22 * L.figures * root.dpr));
             ctx.beginPath();
             for (var li = 0; li < c.lines.length; li++) {
                 var prev = null;
@@ -624,35 +720,46 @@ Item {
             ctx.stroke();
 
             // ---- stars ----
+            // (sorted by color: fillStyle changes a few hundred times, not 5,000)
+            lastFill = "";
+            var lim = L.lim;
             for (var i = 0; i < c.stars.length; i++) {
-                var s = c.stars[i], w = SM.mul(f.A, s.v);
-                if (w[2] < 0) continue;
-                var p = f.pr.project(w);
-                if (!root.onScreen(p, W, H, 6)) continue;
-                var m = s.mag + root.extinction(Math.asin(w[2]));
-                var vis = root.seen(m, L.lim);
-                if (m > 6.2 || vis < 0.02) continue;
+                var s = c.stars[i], sv = s.v, s0 = sv[0], s1 = sv[1], s2 = sv[2];
+                var sz = MZ[0] * s0 + MZ[1] * s1 + MZ[2] * s2;
+                if (sz < 0) continue;
+                var sfw = MF[0] * s0 + MF[1] * s1 + MF[2] * s2;
+                if (sfw < -0.3) continue;
+                var sk = S2 / (1 + sfw);
+                var px = mcx + sk * (MR[0] * s0 + MR[1] * s1 + MR[2] * s2);
+                var py = mcy - sk * (MU[0] * s0 + MU[1] * s1 + MU[2] * s2);
+                if (px <= -6 || px >= W + 6 || py <= -6 || py >= H + 6) continue;
+                var m = s.mag + ext[Math.round(sz * extN)];
+                if (m > 6.2) continue;
+                var vis = root.seen(m, lim);
+                if (vis < 0.02) continue;
                 var a = Math.max(0.32, Math.min(1, 1.15 - 0.13 * m)) * vis;
                 var r = Math.max(0.7, Math.min(3.4, 2.6 - 0.36 * m));
+                ctx.globalAlpha = a;
                 if (m < 1.2) {                         // halo for the brightest
-                    var hg = ctx.createRadialGradient(p[0], p[1], 0, p[0], p[1], r * 4);
-                    hg.addColorStop(0, s.rgb + (0.35 * a).toFixed(3) + ")");
+                    var hg = ctx.createRadialGradient(px, py, 0, px, py, r * 4);
+                    hg.addColorStop(0, s.rgb + "0.35)");
                     hg.addColorStop(1, s.rgb + "0)");
                     ctx.fillStyle = hg;
-                    ctx.fillRect(p[0] - r * 4, p[1] - r * 4, r * 8, r * 8);
+                    ctx.fillRect(px - r * 4, py - r * 4, r * 8, r * 8);
+                    lastFill = "";
                 }
-                ctx.fillStyle = s.rgb + a.toFixed(3) + ")";
+                if (s.hex !== lastFill) { ctx.fillStyle = s.hex; lastFill = s.hex; }
                 if (r < 1.1) {
-                    ctx.fillRect(p[0] - r, p[1] - r, 2 * r, 2 * r);
+                    ctx.fillRect(px - r, py - r, 2 * r, 2 * r);
                 } else {
                     ctx.beginPath();
-                    ctx.arc(p[0], p[1], r, 0, 2 * Math.PI);
+                    ctx.arc(px, py, r, 0, 2 * Math.PI);
                     ctx.fill();
                 }
             }
+            ctx.globalAlpha = 1;
 
             // ---- named stars ----
-            font(Math.max(9, t.fontSize - 3));
             for (var ni = 0; ni < c.named.length; ni++) {
                 var ns = c.named[ni], nw = SM.mul(f.A, ns.v);
                 if (nw[2] < 0.03) continue;
@@ -660,8 +767,7 @@ Item {
                 if (!root.onScreen(np, W, H, 0)) continue;
                 var nvis = root.seen(ns.mag + root.extinction(Math.asin(nw[2])), L.lim);
                 if (nvis < 0.25) continue;                    // its star isn't out yet
-                ctx.fillStyle = Lib.css(root.label, 0.75 * nvis);
-                ctx.fillText(ns.name.toLowerCase(), np[0] + 6, np[1] - 5);
+                label(ns.name.toLowerCase(), np[0] + 6, np[1] - 5, Math.max(9, t.fontSize - 3), root.label, 0.75 * nvis);
                 var naa = SM.altaz(nw);
                 hits.push({ x: np[0], y: np[1], title: ns.name,
                             lines: ["star · mag " + ns.mag.toFixed(2),
@@ -670,15 +776,12 @@ Item {
             }
 
             // ---- constellation names ----
-            font(Math.max(9, t.fontSize - 4), "bold");
-            ctx.fillStyle = Lib.css(t.accent2, 0.3 * L.figures);
             for (var ci = 0; ci < c.labels.length; ci++) {
                 var cw = SM.mul(f.A, c.labels[ci].v);
                 if (cw[2] < 0.08) continue;
                 var cp = f.pr.project(cw);
                 if (!root.onScreen(cp, W, H, -20)) continue;
-                var txt = c.labels[ci].name.toUpperCase().split("").join(" ");
-                ctx.fillText(txt, cp[0] - ctx.measureText(txt).width / 2, cp[1]);
+                label(c.labels[ci].spaced, cp[0], cp[1], Math.max(9, t.fontSize - 4), t.accent2, 0.3 * L.figures, true, true);
             }
 
             // ---- planets ----
@@ -702,9 +805,7 @@ Item {
                 ctx.beginPath();
                 ctx.arc(bp[0], bp[1], br, 0, 2 * Math.PI);
                 ctx.fill();
-                font(Math.max(9, t.fontSize - 2));
-                ctx.fillStyle = Lib.hexA(tint, 0.9 * Math.max(0.45, pv));
-                ctx.fillText(b.name, bp[0] + br + 5, bp[1] + 4);
+                label(b.name, bp[0] + br + 5, bp[1] + 4, Math.max(9, t.fontSize - 2), tint, 0.9 * Math.max(0.45, pv));
                 var baa = SM.altaz(b.w);
                 hits.push({ x: bp[0], y: bp[1], title: b.name,
                             lines: ["planet · mag " + (b.mag >= 0 ? "+" : "−") + Math.abs(b.mag).toFixed(1)
@@ -768,9 +869,7 @@ Item {
                     ctx.fillStyle = illum < 0.5 ? dark : lit;
                     ctx.beginPath(); ctx.ellipse(-rx, -mr, 2 * rx, 2 * mr); ctx.fill();
                     ctx.restore();
-                    font(Math.max(9, t.fontSize - 2));
-                    ctx.fillStyle = Lib.css(t.foreground, 0.8);
-                    ctx.fillText("moon " + Math.round(illum * 100) + "%", mp[0] + mr + 6, mp[1] + 4);
+                    label("moon " + Math.round(illum * 100) + "%", mp[0] + mr + 6, mp[1] + 4, Math.max(9, t.fontSize - 2), t.foreground, 0.8);
                     hits.push({ x: mp[0], y: mp[1], title: "moon",
                                 lines: [Math.round(illum * 100) + "% lit · " + Lib.grouped(f.moon.distKm) + " km",
                                         "light left it " + (f.moon.distKm * 1000 / Lib.C).toFixed(2) + " s ago",
@@ -789,17 +888,15 @@ Item {
                 if (!root.onScreen(rp, W, H, 0)) continue;
                 var rc = Lib.css(t.accent4, 0.65);
                 ctx.strokeStyle = rc;
-                ctx.fillStyle = rc;
                 ctx.lineWidth = 1;
+                ctx.beginPath();
                 for (var rk = 0; rk < 8; rk++) {                  // a burst: where the meteors come from
                     var ra0 = rk * Math.PI / 4;
-                    ctx.beginPath();
                     ctx.moveTo(rp[0] + 5 * Math.cos(ra0), rp[1] + 5 * Math.sin(ra0));
                     ctx.lineTo(rp[0] + (rk % 2 ? 9 : 12) * Math.cos(ra0), rp[1] + (rk % 2 ? 9 : 12) * Math.sin(ra0));
-                    ctx.stroke();
                 }
-                font(Math.max(9, t.fontSize - 3));
-                ctx.fillText(sh.shower.name.toLowerCase(), rp[0] + 15, rp[1] + 4);
+                ctx.stroke();
+                label(sh.shower.name.toLowerCase(), rp[0] + 15, rp[1] + 4, Math.max(9, t.fontSize - 3), t.accent4, 0.65);
                 var raltR = Math.asin(rw[2]);
                 var hr = sh.zhr * Math.sin(raltR);
                 var pk = Math.round(sh.days);
@@ -847,6 +944,9 @@ Item {
             var c0 = f.pr.project(SM.enu(0, root.facing)), c1 = f.pr.project(SM.enu(0, root.facing + 1));
             var pxPerDeg = c0 && c1 ? Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) : 0;
             var dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+            // Ticks are collected into one path per style and stroked once each.
+            var tickStyles = [Lib.css(t.foreground, 0.75), Lib.css(t.muted, 0.7), Lib.css(t.muted, 0.45)];
+            var ticks = [[], [], []];
             for (var h = 0; h < 720; h++) {                        // half degrees: NNE & co. sit at 22.5°
                 var point = h % 45 === 0;                           // one of the 16 compass points
                 if (h % 2 && !point) continue;
@@ -859,28 +959,105 @@ Item {
                 if (!p1) continue;
                 var nx = p1[0] - p0[0], ny = p1[1] - p0[1], nl = Math.hypot(nx, ny) || 1;
                 nx /= nl; ny /= nl;
-                ctx.strokeStyle = Lib.css(mid ? t.foreground : t.muted, mid ? 0.75 : deg % 10 === 0 ? 0.7 : 0.45);
-                ctx.lineWidth = 1;
-                ctx.beginPath();
-                ctx.moveTo(p0[0], p0[1]);
-                ctx.lineTo(p0[0] + nx * len, p0[1] + ny * len);
-                ctx.stroke();
+                ticks[mid ? 0 : deg % 10 === 0 ? 1 : 2].push(p0[0], p0[1], p0[0] + nx * len, p0[1] + ny * len);
 
-                var label = point ? dirs[h / 45] : deg % 30 === 0 ? deg + "°" : "";
-                if (label === "" || (!mid && point && pxPerDeg < 6)) continue;   // NNE etc. only when there's room
-                font(major ? t.fontSize - 1 : mid ? t.fontSize - 2 : t.fontSize - 4, major ? "bold" : "");
-                ctx.fillStyle = Lib.css(point ? (mid ? t.foreground : t.muted) : t.muted, point ? 0.85 : 0.6);
+                var lbl = point ? dirs[h / 45] : deg % 30 === 0 ? deg + "°" : "";
+                if (lbl === "" || (!mid && point && pxPerDeg < 6)) continue;   // NNE etc. only when there's room
                 var off = len + (major ? 14 : 11);
-                ctx.fillText(label, p0[0] + nx * off - ctx.measureText(label).width / 2, p0[1] + ny * off + 4);
+                label(lbl, p0[0] + nx * off, p0[1] + ny * off + 4,
+                      major ? t.fontSize - 1 : mid ? t.fontSize - 2 : t.fontSize - 4,
+                      point && mid ? t.foreground : t.muted, point ? 0.85 : 0.6, major, true);
+            }
+            ctx.lineWidth = 1;
+            for (var ts = 0; ts < 3; ts++) {
+                var tk = ticks[ts];
+                if (!tk.length) continue;
+                ctx.strokeStyle = tickStyles[ts];
+                ctx.beginPath();
+                for (var tj = 0; tj < tk.length; tj += 4) { ctx.moveTo(tk[tj], tk[tj + 1]); ctx.lineTo(tk[tj + 2], tk[tj + 3]); }
+                ctx.stroke();
             }
 
+            root.placeLabels(labs);
+            root.targets = hits;
+        }
+    }
+
+    // ================= labels: Text items over the main layer =================
+    // A fixed pool, enough for every name that can be up at once; main's paint
+    // hands over a list and placeLabels() positions them (only properties that
+    // change are written, and unused ones are hidden).
+    readonly property int labelCap: SD.NAMED.length + SD.LABELS.length + 16 + EV.SHOWERS.length + 32
+    property int labelsShown: 0
+    function placeLabels(labs) {
+        var n = Math.min(labs.length, labelPool.count), i;
+        for (i = 0; i < n; i++) {
+            var l = labs[i], it = labelPool.itemAt(i);
+            if (it.text !== l.t) it.text = l.t;
+            if (it.font.pixelSize !== l.px) it.font.pixelSize = l.px;
+            if (it.font.bold !== l.b) it.font.bold = l.b;
+            it.color = l.c;
+            it.opacity = l.a;
+            it.x = l.ctr ? l.x - it.implicitWidth / 2 : l.x;
+            it.y = l.y - it.baselineOffset;         // canvas text sat on its baseline
+            if (!it.visible) it.visible = true;
+        }
+        for (; i < labelsShown; i++) labelPool.itemAt(i).visible = false;
+        labelsShown = n;
+    }
+    Item {
+        anchors.fill: parent
+        Repeater {
+            id: labelPool
+            model: root.labelCap
+            Text {
+                visible: false
+                font.family: root.theme.fontFamily
+                font.pixelSize: 10
+            }
+        }
+    }
+
+    // ================= layer 4: readout and time strip =================
+    // Doesn't depend on where you're looking (beyond the "facing" word), so it
+    // has its own canvas that repaints when the time does, not on every scroll.
+    readonly property var compassNames: ["north", "north-northeast", "northeast", "east-northeast", "east", "east-southeast",
+                                         "southeast", "south-southeast", "south", "south-southwest", "southwest", "west-southwest",
+                                         "west", "west-northwest", "northwest", "north-northwest"]
+    readonly property string facingName: compassNames[Math.round(SM.mod(facing, 360) / 22.5) % 16]
+    property string hudKey: ""
+    function paintHud() {
+        var k = [facingName, nowMs, offsetMin, latitude, longitude, width, height, dpr, !!cat].join("|");
+        if (k === hudKey) return;
+        hudKey = k;
+        hud.requestPaint();
+    }
+
+    Canvas {
+        id: hud
+        readonly property real band: 120                  // bottom of the screen: readout + strip
+        y: root.height - band
+        width: root.width
+        height: band
+        onPaint: {
+            var ctx = getContext("2d");
+            ctx.reset();
+            if (!root.cat) return;
+            ctx.translate(0, -hud.y);                     // draw in the view's own coordinates
+            var W = root.width, H = root.height, f = root.frame(W, H), t = root.theme;
+            var L = root.skyLight(f);
+            var sunAA = SM.altaz(f.sun.w), maa = SM.altaz(f.moon.w);
+            var illum = (1 - Math.max(-1, Math.min(1, SM.dot(SM.norm(f.moon.w), SM.norm(f.sun.w))))) / 2;
+            var curFont = "";
+            var font = function (px, extra) {
+                var fs = (extra ? extra + " " : "") + px + "px " + root.fontCss;
+                if (fs !== curFont) { ctx.font = fs; curFont = fs; }
+            };
+
             // ---- readout, bottom left on the ground ----
-            var names = ["north", "north-northeast", "northeast", "east-northeast", "east", "east-southeast",
-                         "southeast", "south-southeast", "south", "south-southwest", "southwest", "west-southwest",
-                         "west", "west-northwest", "northwest", "north-northwest"];
-            var facingName = names[Math.round(SM.mod(root.facing, 360) / 22.5) % 16];
+            var facingName = root.facingName;
             var lst = SM.lstHours(f.jd, root.longitude);
-            var hud = [
+            var readout = [
                 "facing " + facingName + " · lst " + Lib.hours(lst, true) + " · "
                     + Math.abs(root.latitude).toFixed(2) + "°" + (root.latitude >= 0 ? "N " : "S ")
                     + Math.abs(root.longitude).toFixed(2) + "°" + (root.longitude >= 0 ? "E" : "W"),
@@ -890,13 +1067,13 @@ Item {
             ];
             if (root.offsetMin !== 0) {
                 var om = Math.abs(root.offsetMin);
-                hud.push("time warp T" + (root.offsetMin > 0 ? "+" : "−") + Math.floor(om / 60) + "h"
+                readout.push("time warp T" + (root.offsetMin > 0 ? "+" : "−") + Math.floor(om / 60) + "h"
                          + Lib.pad(Math.round(om % 60), 2) + "m · middle-click: now");
             }
             font(Math.max(9, t.fontSize - 3));
-            for (var hi = 0; hi < hud.length; hi++) {
+            for (var hi = 0; hi < readout.length; hi++) {
                 ctx.fillStyle = hi === 2 ? Lib.css(t.accent4, 0.9) : Lib.css(root.label, 0.85);
-                ctx.fillText(hud[hi], 24, H - 46 + hi * 15);
+                ctx.fillText(readout[hi], 24, H - 46 + hi * 15);
             }
             ctx.fillStyle = Lib.css(t.muted, 0.8);
             ctx.fillText("scroll: turn · scroll the ground or drag the strip: time", 24, H - 46 - 32);
@@ -983,7 +1160,6 @@ Item {
                 root.strip = { x0: x0, x1: x1, y0: sy - 40, y1: sy + bh + 18, t0: a.t0, t1: a.t1 };
             }
 
-            root.targets = hits;
         }
     }
 
