@@ -6,6 +6,7 @@ vim.o.wrap = false
 vim.o.tabstop = 4
 vim.o.shiftwidth = 4
 vim.o.softtabstop = 4
+vim.o.clipboard = "unnamedplus"
 vim.o.swapfile = false
 vim.o.completeopt = "menu,menuone,noinsert,noselect"
 vim.o.updatetime = 250
@@ -15,6 +16,52 @@ vim.keymap.set('n', '<leader>w', ':write<CR>')
 vim.keymap.set('n', '<leader>q', ':quit<CR>')
 vim.keymap.set('n', '<leader>lf', vim.lsp.buf.format)
 vim.keymap.set('n', '<Esc>', '<cmd>noh<CR>', { silent = true })
+vim.keymap.set('n', '<leader>n', '<cmd>tabnew<CR>', { desc = 'New tab' })
+vim.keymap.set('n', '<leader>x', '<cmd>tabclose<CR>', { desc = 'Close tab' })
+for i = 1, 9 do
+  vim.keymap.set('n', '<leader>' .. i, '<cmd>tabnext ' .. i .. '<CR>', { desc = 'Go to tab ' .. i })
+end
+local tab_buf, closed_tabs = {}, {}
+
+vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+  callback = function(ev)
+    if vim.bo[ev.buf].buftype == "" then  -- real files only, not the run terminal
+      tab_buf[vim.api.nvim_get_current_tabpage()] = ev.buf
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("TabClosed", {
+  callback = function()
+    for tab, buf in pairs(tab_buf) do
+      if not vim.api.nvim_tabpage_is_valid(tab) then
+        table.insert(closed_tabs, buf)
+        tab_buf[tab] = nil
+      end
+    end
+  end,
+})
+
+vim.keymap.set("n", "<leader>u", function()
+  local buf = table.remove(closed_tabs)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    vim.cmd("tab sbuffer " .. buf)
+  else
+    vim.notify("No closed tab to reopen", vim.log.levels.INFO)
+  end
+end, { desc = "Reopen last closed tab" })
+function _G.Tabline()
+  local s = ""
+  for i = 1, vim.fn.tabpagenr("$") do
+    local buf = vim.fn.tabpagebuflist(i)[vim.fn.tabpagewinnr(i)]
+    local name = vim.fn.fnamemodify(vim.fn.bufname(buf), ":t")
+    if name == "" then name = "[No Name]" end
+    s = s .. (i == vim.fn.tabpagenr() and "%#TabLineSel#" or "%#TabLine#")
+          .. "%" .. i .. "T " .. i .. " " .. name:gsub("%%", "%%%%") .. " "
+  end
+  return s .. "%#TabLineFill#%T"
+end
+vim.o.tabline = "%!v:lua.Tabline()"
 vim.g.closetag_filenames = '*.html,*.xhtml'
 vim.pack.add({
 		{src="https://github.com/nvim-lua/plenary.nvim"},
@@ -94,27 +141,10 @@ local runners = {
 
 local run = { win = nil, buf = nil }
 
-vim.keymap.set("n", "<leader>r", function()
-  local cmd = runners[vim.bo.filetype]
-  if not cmd then
-    vim.notify("No runner for " .. vim.bo.filetype, vim.log.levels.WARN)
-    return
-  end
-
-  vim.cmd("write")
-  local file = vim.fn.shellescape(vim.fn.expand("%:p"))
-  local out  = vim.fn.shellescape(vim.fn.expand("%:p:r"))
-  cmd = cmd:gsub("{file}", function() return file end)
-           :gsub("{out}",  function() return out end)
-local root = vim.fs.root(0, "Makefile")
-if root then
-  local make = vim.fn.executable("direnv") == 1 and "direnv exec . make run" or "make run"
-  cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. make
-end
-
+-- run `cmd` in a fresh terminal in the bottom pane (reused if still open)
+local function term_run(cmd, cwd)
   local src_win = vim.api.nvim_get_current_win()
 
-  -- reuse the output window if it's still open, otherwise create it
   if run.win and vim.api.nvim_win_is_valid(run.win) then
     vim.api.nvim_set_current_win(run.win)
   else
@@ -130,8 +160,72 @@ end
     vim.api.nvim_buf_delete(old, { force = true })  -- also kills a still-running job
   end
 
-  vim.fn.jobstart(cmd, { term = true })
+  vim.fn.jobstart(cmd, { term = true, cwd = cwd })
   vim.cmd("normal! G")  -- cursor on last line so the pane follows output
 
   vim.api.nvim_set_current_win(src_win)
-end, { desc = "Run current file" })
+end
+
+-- what kind of project the current buffer is in, and its root
+local function project()
+  -- prefer the repo/flake root so a nested src/CMakeLists.txt isn't mistaken for the top
+  local top = vim.fs.root(0, { ".git", "flake.nix" })
+  if top and vim.uv.fs_stat(top .. "/CMakeLists.txt") then return "cmake", top end
+  local root = vim.fs.root(0, "CMakeLists.txt")
+  if root then return "cmake", root end
+  root = vim.fs.root(0, "Makefile")
+  if root then return "make", root end
+end
+
+-- wrap `cmd` so it runs inside the project's dev shell
+local function in_env(root, cmd)
+  if vim.fn.executable("direnv") == 1 and vim.uv.fs_stat(root .. "/.envrc") then
+    return "direnv exec . sh -c " .. vim.fn.shellescape(cmd)
+  elseif vim.uv.fs_stat(root .. "/flake.nix") then
+    return "nix develop --command sh -c " .. vim.fn.shellescape(cmd)
+  end
+  return cmd
+end
+
+local cmake = { dir = "build", type = "Release" }
+
+-- configure once (cmake --build re-runs it when CMakeLists change), then build everything
+local function cmake_build()
+  local d, j = cmake.dir, vim.uv.available_parallelism()
+  return ("[ -f %s/CMakeCache.txt ] || cmake -S . -B %s -DCMAKE_BUILD_TYPE=%s -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+          .. " && cmake --build %s -j %d"):format(d, d, cmake.type, d, j)
+end
+
+vim.keymap.set("n", "<leader>r", function()
+  local kind, root = project()
+  if kind == "cmake" then
+    vim.cmd("wall")
+    return term_run(in_env(root, cmake_build() .. " && cmake --build " .. cmake.dir .. " --target run"), root)
+  elseif kind == "make" then
+    vim.cmd("wall")
+    return term_run(in_env(root, "make run"), root)
+  end
+
+  local cmd = runners[vim.bo.filetype]
+  if not cmd then
+    vim.notify("No runner for " .. vim.bo.filetype, vim.log.levels.WARN)
+    return
+  end
+  vim.cmd("write")
+  local file = vim.fn.shellescape(vim.fn.expand("%:p"))
+  local out  = vim.fn.shellescape(vim.fn.expand("%:p:r"))
+  cmd = cmd:gsub("{file}", function() return file end)
+           :gsub("{out}",  function() return out end)
+  term_run(cmd)
+end, { desc = "Run project or current file" })
+
+vim.keymap.set("n", "<leader>t", function()
+  local kind, root = project()
+  if kind ~= "cmake" then
+    vim.notify("Not in a CMake project", vim.log.levels.WARN)
+    return
+  end
+  vim.cmd("wall")
+  local j = vim.uv.available_parallelism()
+  term_run(in_env(root, cmake_build() .. (" && ctest --test-dir %s --output-on-failure -j %d"):format(cmake.dir, j)), root)
+end, { desc = "Build and run CTest" })
