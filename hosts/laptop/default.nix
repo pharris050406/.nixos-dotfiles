@@ -5,7 +5,7 @@
     ./eq-autoswitch.nix
   ];
 
-	home-manager.users.p.home.pointerCursor = {
+  home-manager.users.p.home.pointerCursor = {
     enable = true;
     package = pkgs.adwaita-icon-theme;
     name = "Adwaita";

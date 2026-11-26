@@ -16,6 +16,16 @@
     powerOnBoot = true;
   };
 
+  # weekly: drop system generations older than 2 weeks, then delete what
+  # nothing uses anymore; and deduplicate identical files as they're added
+  nix.gc = {
+    automatic = true;
+    dates = "weekly";
+    options = "--delete-older-than 14d";
+  };
+  nix.settings.auto-optimise-store = true;
+  boot.loader.systemd-boot.configurationLimit = 10; # keep the boot partition from filling up
+
   # nmcli / nmtui
   networking.networkmanager = {
     enable = true;

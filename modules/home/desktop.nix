@@ -1,5 +1,10 @@
 # sway session: dotfiles, bar, cursor, xdg dirs.
-{ config, libs, pkgs, ... }:
+{
+  config,
+  libs,
+  pkgs,
+  ...
+}:
 let
   home = config.home.homeDirectory;
 in
@@ -11,7 +16,6 @@ in
   xdg.configFile."trace/trace.qml".source = ../../config-files/trace/trace.qml;
 
   home.packages = with pkgs; [
-    swayfx
     autotiling
     quickshell
     wmenu

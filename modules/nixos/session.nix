@@ -1,6 +1,12 @@
 # Graphical session: autologin into sway, audio, portals, fonts.
 { pkgs, ... }:
 {
+  programs.sway = {
+    enable = true;
+    package = pkgs.swayfx;
+    extraPackages = [ ]; # don't pull in the default foot/dmenu/swaylock set
+  };
+  security.pam.services.swaylock = { };
   # tty1 login starts sway right away (bash is the login shell; foot runs zsh)
   programs.bash.loginShellInit = ''
     if [ -z "$WAYLAND_DISPLAY" ] && [ "$XDG_VTNR" = 1 ]; then

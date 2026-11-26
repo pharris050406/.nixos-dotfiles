@@ -122,6 +122,9 @@ bindsym --locked XF86MonBrightnessUp exec brightnessctl set 5%+
 bindsym Print exec sh -c 'f=~/Pictures/Screenshots/$(date +%Y-%m-%d_%H-%M-%S).png; mkdir -p ~/Pictures/Screenshots; grim -g "$(slurp)" "$f" && wl-copy < "$f"'
 bindsym Shift+Print exec sh -c 'f=~/Pictures/Screenshots/$(date +%Y-%m-%d_%H-%M-%S).png; mkdir -p ~/Pictures/Screenshots; grim - | satty --filename - --output-filename "$f" --initial-tool crop --copy-command wl-copy --early-exit'
 
+bindsym $mod+Escape exec swaylock -f
+for_window [all] inhibit_idle fullscreen
+
 bindsym $mod+t exec trace
 bindsym $mod+Ctrl+c exec trace -c
 bindsym $mod+Shift+t exec trace edit

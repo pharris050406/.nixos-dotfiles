@@ -40,17 +40,16 @@
     '';
   };
 
-	services.ssh-agent.enable = true;
+  services.ssh-agent.enable = true;
 
-	programs.ssh = {
-		enable = true;
-		enableDefaultConfig = false;
-		matchBlocks = {
-			"*".addKeysToAgent = "yes";
-			"server.pharris.io".proxyCommand =
-				"${pkgs.cloudflared}/bin/cloudflared access ssh --hostname %h";
-		};
-	};
+  programs.ssh = {
+    enable = true;
+    enableDefaultConfig = false;
+    matchBlocks = {
+      "*".addKeysToAgent = "yes";
+      "server.pharris.io".proxyCommand = "${pkgs.cloudflared}/bin/cloudflared access ssh --hostname %h";
+    };
+  };
 
   programs.git.enable = true;
 
