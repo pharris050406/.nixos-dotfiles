@@ -9,7 +9,10 @@ let
 
   eq-autoswitch = pkgs.writeShellApplication {
     name = "eq-autoswitch";
-    runtimeInputs = with pkgs; [ pulseaudio gawk ];
+    runtimeInputs = with pkgs; [
+      pulseaudio
+      gawk
+    ];
     text = ''
       HW=${hw}
       EQ=${eq}
@@ -43,7 +46,10 @@ in
   home-manager.users.p.systemd.user.services.eq-autoswitch = {
     Unit = {
       Description = "Bypass the speaker EQ when headphones are plugged in";
-      After = [ "pipewire-pulse.service" "wireplumber.service" ];
+      After = [
+        "pipewire-pulse.service"
+        "wireplumber.service"
+      ];
     };
     Service = {
       ExecStart = "${eq-autoswitch}/bin/eq-autoswitch";

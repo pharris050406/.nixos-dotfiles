@@ -2,14 +2,14 @@
 let
   settings = {
     # tabs / startup
-    "browser.ctrlTab.sortByRecentlyUsed" = true;   # Ctrl+Tab in recently-used order
+    "browser.ctrlTab.sortByRecentlyUsed" = true; # Ctrl+Tab in recently-used order
     "browser.startup.homepage" = "chrome://browser/content/blanktab.html";
-    "browser.newtabpage.enabled" = false;          # blank new tab
-    "browser.fullscreen.autohide" = false;         # keep toolbars in fullscreen
-    "general.autoScroll" = true;                   # middle-click autoscroll
+    "browser.newtabpage.enabled" = false; # blank new tab
+    "browser.fullscreen.autohide" = false; # keep toolbars in fullscreen
+    "general.autoScroll" = true; # middle-click autoscroll
 
     # address bar
-    "browser.urlbar.suggest.quicksuggest.all" = false;   # no Firefox Suggest
+    "browser.urlbar.suggest.quicksuggest.all" = false; # no Firefox Suggest
     "browser.urlbar.suggest.history" = false;
     "browser.urlbar.suggest.engines" = false;
     "browser.urlbar.suggest.quickactions" = false;
@@ -24,12 +24,15 @@ let
     # "dom.webgpu.enabled" = true;
   };
 
-  userJs = pkgs.writeText "firefox-user.js" (lib.concatStrings (lib.mapAttrsToList
-    (n: v: "user_pref(${builtins.toJSON n}, ${builtins.toJSON v});\n") settings));
+  userJs = pkgs.writeText "firefox-user.js" (
+    lib.concatStrings (
+      lib.mapAttrsToList (n: v: "user_pref(${builtins.toJSON n}, ${builtins.toJSON v});\n") settings
+    )
+  );
 
   amo = slug: {
     install_url = "https://addons.mozilla.org/firefox/downloads/latest/${slug}/latest.xpi";
-    installation_mode = "normal_installed";   # auto-installed; can be disabled, not removed
+    installation_mode = "normal_installed"; # auto-installed; can be disabled, not removed
   };
 in
 {
