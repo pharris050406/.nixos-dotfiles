@@ -1,13 +1,17 @@
-# Screen lock: swaylock in the Deep Field colors, locked by swayidle after
-# 5 min idle, screens off after 10, and always before sleep (closing the
-# laptop lid suspends, so that locks too). $mod+Escape locks by hand.
+# Screen lock: the Quickshell lock screen (config-files/quickshell/lock.qml),
+# via the `lockscreen` script, which falls back to swaylock if it ever fails.
+# Locks after 5 min idle and before every sleep (closing the lid suspends, so
+# that locks too); screens go off after 10 min. $mod+Escape locks by hand.
 # Fullscreen windows (videos) hold off the idle timer: see the sway config.
-{ config, pkgs, ... }:
+{ pkgs, ... }:
 let
-  lock = "${config.programs.swaylock.package}/bin/swaylock -f";
+  lock = "${pkgs.lockscreen}/bin/lockscreen";
   swaymsg = "${pkgs.swayfx}/bin/swaymsg";
 in
 {
+  home.packages = [ pkgs.lockscreen ];
+
+  # The fallback, in the same colours.
   programs.swaylock = {
     enable = true;
     settings = {

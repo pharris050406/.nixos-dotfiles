@@ -1,0 +1,37 @@
+# lockscreen — lock the session with the Quickshell lock (lock.qml), and
+# return only once every screen is actually locked, so swayidle's
+# before-sleep can wait on it. If the Quickshell lock doesn't come up within
+# 3 s for any reason, falls back to swaylock: the screen always ends up locked.
+
+qml="$HOME/.config/quickshell/lock.qml"
+run=${XDG_RUNTIME_DIR:-/tmp}
+state="$run/qs-lock.state"
+me=$(id -u)
+
+# One at a time (the idle timer and the lid can fire together).
+exec 9>"$run/qs-lock.lock"
+flock 9
+
+running() { pgrep -u "$me" -f "quickshell -p $qml" >/dev/null; }
+
+# Already locked: nothing to do.
+if running && [ "$(cat "$state" 2>/dev/null)" = locked ]; then
+    exit 0
+fi
+
+# A leftover (unlocked but still running, or stuck starting): replace it.
+pkill -u "$me" -f "quickshell -p $qml" 2>/dev/null || true
+rm -f "$state"
+
+setsid -f quickshell -p "$qml" >/dev/null 2>&1 9>&-
+
+i=0
+while [ "$i" -lt 60 ]; do
+    [ "$(cat "$state" 2>/dev/null)" = locked ] && exit 0
+    sleep 0.05
+    i=$((i + 1))
+done
+
+# Didn't lock in time: never leave the screen unlocked.
+pkill -u "$me" -f "quickshell -p $qml" 2>/dev/null || true
+exec swaylock -f 9>&-

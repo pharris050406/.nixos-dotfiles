@@ -25,7 +25,7 @@
   };
   nix.settings.auto-optimise-store = true;
   boot.loader.systemd-boot.configurationLimit = 10; # keep the boot partition from filling up
-boot.loader.systemd-boot.editor = false;
+  boot.loader.systemd-boot.editor = false;
   # nmcli / nmtui
   networking.networkmanager = {
     enable = true;

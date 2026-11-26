@@ -4,4 +4,5 @@ final: prev: {
   ksa = final.callPackage ./ksa.nix { };
   blender-luxcore = final.callPackage ./blender-luxcore.nix { };
   sinkvol = final.callPackage ./sinkvol { };
+  lockscreen = final.callPackage ./lockscreen { };
 }

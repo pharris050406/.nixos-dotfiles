@@ -35,6 +35,7 @@ Item {
     property bool live: true             // follow the real clock (tests pin nowMs instead)
     property bool meteors: true          // Sky.qml ties this to the bar's motion setting
     property int refreshMs: 30000
+	property bool interactive: true
 
     signal turned(real facing)
     signal zoomed(real fov)
@@ -1027,6 +1028,7 @@ Item {
     readonly property string facingName: compassNames[Math.round(SM.mod(facing, 360) / 22.5) % 16]
     property string hudKey: ""
     function paintHud() {
+		if (!interactive) return;
         var k = [facingName, nowMs, offsetMin, latitude, longitude, width, height, dpr, !!cat].join("|");
         if (k === hudKey) return;
         hudKey = k;
@@ -1035,6 +1037,7 @@ Item {
 
     Canvas {
         id: hud
+		visible: root.interactive
         readonly property real band: 120                  // bottom of the screen: readout + strip
         y: root.height - band
         width: root.width
@@ -1212,6 +1215,7 @@ Item {
     MouseArea {
         id: mouse
         anchors.fill: parent
+		enabled: root.interactive
         hoverEnabled: true
         acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
         cursorShape: root.stripHover || root.scrubbing ? Qt.SizeHorCursor : Qt.ArrowCursor
