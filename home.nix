@@ -17,7 +17,9 @@
 	home.file.".config/quickshell".source = ./config-files/quickshell;
 	home.file.".config/nvim".source = ./config-files/nvim;
 	home.file.".config/foot".source = ./config-files/foot;
-	programs.firefox.enable=true;
+	imports=[
+		./modules/home/firefox.nix
+	];
 	# add packages
 	home.packages = with pkgs;[
 		ripgrep
