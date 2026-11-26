@@ -22,7 +22,7 @@
           system = "x86_64-linux";
           specialArgs = { inherit inputs; };
           modules = [
-            ./configuration.nix
+            ./modules/nixos
             ./hosts/${name}
             { networking.hostName = name; }
             home-manager.nixosModules.home-manager
@@ -31,7 +31,7 @@
                 useGlobalPkgs = true;
                 useUserPackages = true;
                 extraSpecialArgs = { inherit inputs; };
-                users.p = import ./home.nix;
+                users.p = import ./modules/home;
                 backupFileExtension = "backup";
               };
             }
