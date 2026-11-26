@@ -3,6 +3,7 @@
   imports = [
     ./shell.nix
     ./desktop.nix
+	./lock.nix
     ./media.nix
     ./apps.nix
     ./firefox.nix
