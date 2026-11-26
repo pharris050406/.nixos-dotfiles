@@ -16,11 +16,27 @@ import Quickshell.Services.Pipewire
 Singleton {
     id: audio
 
-    readonly property PwNode sink: Pipewire.defaultAudioSink
+	// If the default output is a filter-chain EQ (effect_input.X), control the
+    // hardware sink its effect_output.X is pinned to instead (same rule as the
+    // sinkvol script behind the volume keys). The EQ stays at 100%; volume and
+    // mute live on the device's ports, so a headphone unplug can't blast them.
+    readonly property PwNode defaultSink: Pipewire.defaultAudioSink
+    readonly property PwNode eqOut: {
+        const d = defaultSink;
+        if (!d || !d.name.startsWith("effect_input.")) return null;
+        const want = "effect_output." + d.name.slice("effect_input.".length);
+        return Pipewire.nodes.values.find(n => n.name === want) ?? null;
+    }
+    readonly property PwNode sink: {
+        if (!eqOut || !eqOut.properties) return defaultSink;
+        const t = eqOut.properties["target.object"];
+        return Pipewire.nodes.values.find(n => n.name === t) ?? defaultSink;
+    }
     readonly property bool ready: sink !== null && sink.audio !== null && sink.ready
 
-    // The sink's volume/mute are only valid while it's bound.
-    PwObjectTracker { objects: [audio.sink] }
+    // The sink's volume/mute are only valid while it's bound, and eqOut's
+    // properties only once it's bound too.
+    PwObjectTracker { objects: [audio.sink, audio.eqOut] }
 
     readonly property int volume: ready ? Math.round(sink.audio.volume * 100) : 0
     readonly property bool muted: ready ? sink.audio.muted : false

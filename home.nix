@@ -36,6 +36,7 @@
 		
 		trace
 		blender-luxcore
+		sinkvol
 		(python3.withPackages (ps: with ps; [ numpy scipy pillow ]))
 		wl-clipboard
 		libnotify

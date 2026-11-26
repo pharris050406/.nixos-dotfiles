@@ -1,0 +1,28 @@
+# sinkvol — volume keys for the default output.
+#
+#   sinkvol up | down | mute
+#
+# If the default output is a filter-chain EQ (effect_input.X), act on the
+# hardware sink its effect_output.X is pinned to (target.object) instead.
+# The EQ itself stays at 100%; volume and mute live on the device, which keeps
+# them per port (speakers vs headphones) and restores them the instant the
+# port switches, so unplugging headphones can't blast muted speakers.
+
+id=@DEFAULT_AUDIO_SINK@
+def=$(wpctl inspect @DEFAULT_AUDIO_SINK@ | sed -n 's/^[ *]*node\.name = "\(.*\)"$/\1/p')
+
+case $def in
+  effect_input.*)
+    hw=$(pw-dump | jq -r --arg o "effect_output.${def#effect_input.}" '
+      (map(select(.info.props["node.name"]? == $o)) | .[0].info.props["target.object"]) as $t
+      | map(select(.info.props["node.name"]? == $t)) | .[0].id // empty')
+    if [ -n "$hw" ]; then id=$hw; fi
+    ;;
+esac
+
+case ${1:-} in
+  up)   wpctl set-volume -l 1.0 "$id" 2.5%+ ;;
+  down) wpctl set-volume "$id" 2.5%- ;;
+  mute) wpctl set-mute "$id" toggle ;;
+  *)    echo "usage: sinkvol up|down|mute" >&2; exit 1 ;;
+esac
