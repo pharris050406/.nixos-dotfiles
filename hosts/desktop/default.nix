@@ -17,5 +17,9 @@
       __NV_DISABLE_EXPLICIT_SYNC = "1";
     };
 
+	environment.etc."sway/config.d/desktop.conf".text = ''
+	  bindsym F8 exec ~/.config/quickshell/scripts/media-ctl.sh cycle
+	'';
+
 	services.openssh.enable = true;
   }

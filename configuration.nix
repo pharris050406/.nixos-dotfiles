@@ -89,6 +89,7 @@
 	boot.loader.systemd-boot.consoleMode = "0";
   # programs.firefox.enable = true;
   nixpkgs.config.allowUnfree=true;
+  nixpkgs.overlays = [ (import ./pkgs) ];
 
   # PlatformIO's udev rules (board permissions + stops ModemManager grabbing ports)
   services.udev.packages = [ pkgs.platformio-core.udev ];
@@ -107,7 +108,6 @@
 	emmet-language-server
 	pkg-config
     foot
-	easyeffects
 
     # VSCode inside an FHS sandbox so PlatformIO's downloaded toolchains run
     (pkgs.vscode.fhsWithPackages (ps: with ps; [ python3 ]))

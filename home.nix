@@ -1,38 +1,5 @@
 {config, pkgs, inputs, ...}:
-let
-  dlmusic = pkgs.writeShellApplication {
-    name = "dlmusic";
-    runtimeInputs = with pkgs; [
-      spotdl yt-dlp ffmpeg jq curl mpc python3
-      coreutils findutils gnused
-    ];
-    excludeShellChecks = [ "SC2016" "SC1003" ];
-    text = builtins.readFile ./config-files/sway/scripts/dlmusic;
-  };
-  dotnet = pkgs.dotnetCorePackages.runtime_10_0;
-  ksa = pkgs.buildFHSEnv {
-    name = "ksa";
-    targetPkgs = p: with p; [
-      dotnet
-      vulkan-loader libGL
-      glfw                      # harmless if KSA bundles its own
-      xorg.libX11 xorg.libXcursor xorg.libXrandr xorg.libXi
-      xorg.libXinerama xorg.libXext
-      libxkbcommon wayland
-      icu openssl zlib          # .NET runtime deps
-      alsa-lib libpulseaudio
-      stdenv.cc.cc.lib
-    ];
-    profile = ''
-      export DOTNET_ROOT=${dotnet}/share/dotnet
-      # export XDG_SESSION_TYPE=x11
-    '';
-    runScript = pkgs.writeShellScript "ksa-run" ''
-	  cd "$HOME/Games/ksa/" || exit 1
-	  exec ./KSA "$@"
-	'';
-  };
-in{
+{
 	home.username="p";
 	home.homeDirectory = "/home/p";
 	programs.git.enable=true;
@@ -67,8 +34,8 @@ in{
 		autotiling
 		wmenu
 		
-		(writeScriptBin "trace" (builtins.readFile ./trace))
-		(pkgs.callPackage ./blender-luxcore.nix { })
+		trace
+		blender-luxcore
 		(python3.withPackages (ps: with ps; [ numpy scipy pillow ]))
 		wl-clipboard
 		libnotify
@@ -130,14 +97,6 @@ in{
 		};
 	};
 	
-	# services.easyeffects = {
-	# 	enable = true;
-	# 	preset = "FW13Pro_Raw";
-	# };
-	  xdg.dataFile."easyeffects/output"={
-		source = ./config-files/easyeffects;
-		recursive=true;
-	  };
    xdg.configFile."trace/trace.qml".source = ./config-files/trace/trace.qml;
 	systemd.user.targets.sway-session.Unit = {
 	  Description = "sway session";
