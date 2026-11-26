@@ -13,7 +13,7 @@
       share = true;
     };
     shellAliases = {
-      nrs = "sudo nixos-rebuild switch --flake ~/.nixos-dotfiles";
+		nrs = "nixos-rebuild switch --flake ~/.nixos-dotfiles --sudo";
       ncd = "cd ~/.nixos-dotfiles";
       ls = "ls --color=auto";
       grep = "grep --color=auto";
@@ -58,4 +58,5 @@
     enable = true;
     nix-direnv.enable = true;
   };
+setopt interactive_comments   # allow "# ..." comments in typed/pasted commands
 }
