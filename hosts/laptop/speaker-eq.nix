@@ -60,9 +60,13 @@
           "node.name" = "effect_input.fw13_eq";
           "media.class" = "Audio/Sink";
         };
-        "playback.props" = {
+                "playback.props" = {
           "node.name" = "effect_output.fw13_eq";
           "node.passive" = true;
+          # always play into the built-in device, never Bluetooth/USB
+          "target.object" = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+          "node.dont-fallback" = true;
+          "node.dont-reconnect" = true;
         };
       };
     }];
