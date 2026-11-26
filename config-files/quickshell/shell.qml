@@ -134,13 +134,6 @@ PanelWindow {
     WifiPanel {
         id: wifi
         screen: bar.screen
-        accentColor: pal.accent3
-        textColor: pal.foreground
-        mutedColor: pal.muted
-        bgColor: pal.background
-        warnColor: pal.accent6
-        barColor: pal.barColor
-        fontName: pal.fontFamily
-        fontSize: pal.fontSize
+        theme: pal
     }
 }

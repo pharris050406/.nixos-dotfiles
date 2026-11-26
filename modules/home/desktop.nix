@@ -1,5 +1,5 @@
 # sway session: dotfiles, bar, cursor, xdg dirs.
-{ config, pkgs, ... }:
+{ config, libs, pkgs, ... }:
 let
   home = config.home.homeDirectory;
 in
@@ -24,14 +24,6 @@ in
     trace
     sinkvol
   ];
-
-  home.pointerCursor = {
-    enable = true;
-    package = pkgs.adwaita-icon-theme;
-    name = "Adwaita";
-    size = 16;
-    gtk.enable = true;
-  };
 
   # sway is started by hand from tty1, so graphical-session.target never comes
   # up on its own; sway's config starts this target, which pulls it in.

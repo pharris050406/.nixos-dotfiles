@@ -2,39 +2,36 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import "Lib.js" as Lib
 
-// Wi-Fi panel. Opens under the network widget (left click it).
-//   ↑/↓ or j/k  move        Enter  connect        r  rescan
-//   d / Delete  forget saved network               x  disconnect
-//   e           sign in with username + password (enterprise / eduroam)
-//   Esc         close (or cancel a login form); clicking anywhere outside also closes
-// In a login form: Tab / Shift+Tab move between fields, Ctrl+H shows the password.
-// Mouse works too: click a network to join, right click to forget it.
+// The comms panel: left-click the network widget. Same instrument look as the
+// hover cards and the picker. Shows the wired link if there is one, and the
+// Wi-Fi networks if there's a Wi-Fi adapter.
+// Keys (? in the panel shows them): ↑↓/jk move · enter join · e enterprise login
+//   r rescan · d forget (twice) · x disconnect · esc close
+// Mouse: click joins, right-click (twice) forgets, clicking outside closes.
 PanelWindow {
     id: panel
 
-    property color accentColor: "#8caaee"
-    property color textColor: "#cdd6f4"
-    property color mutedColor: "#585b70"
-    property color bgColor: "#181825"
-    property color warnColor: "#e78284"
-    property color barColor: "#181825"
-    property string fontName: "JetBrainsMono Nerd Font"
-    property int fontSize: 13
+    property Theme theme
     property int rightMargin: 0
 
     readonly property string script: Quickshell.env("HOME") + "/.config/quickshell/scripts/wifi.sh"
-    readonly property color labelColor: Qt.rgba((textColor.r + mutedColor.r) / 2,
-                                                (textColor.g + mutedColor.g) / 2,
-                                                (textColor.b + mutedColor.b) / 2, 1)
+    readonly property color label: Lib.mix(theme.foreground, theme.muted, 0.5)
+    readonly property color edge: Lib.mix(theme.muted, theme.barColor, 0.35)
+    readonly property int pad: 14
+
+    // Wired: the default route goes through something that isn't the Wi-Fi adapter.
+    readonly property bool wired: Net.iface !== "" && Net.iface !== wifiIface
+    readonly property bool hasWifi: error === ""
 
     visible: false
     anchors { top: true; right: true }
     margins.right: rightMargin
     exclusionMode: ExclusionMode.Normal      // sit below the bar, don't reserve space
     exclusiveZone: 0
-    implicitWidth: 400
-    implicitHeight: frame.implicitHeight
+    implicitWidth: 380
+    implicitHeight: frame.height
     color: "transparent"
 
     WlrLayershell.layer: WlrLayer.Overlay
@@ -45,7 +42,7 @@ PanelWindow {
     property string wpaState: ""
     property string currentSsid: ""
     property string ip: ""
-    property string iface: ""
+    property string wifiIface: ""
     property string error: ""
     property var networks: []
     property bool scanning: false
@@ -53,6 +50,7 @@ PanelWindow {
     property string pwFor: ""        // SSID whose login form is open
     property bool pwEap: false       // enterprise form (username/password/domain) vs plain password
     property bool showPw: false
+    property bool help: false
     property string busy: ""
     property string message: ""
     property bool messageBad: false
@@ -61,16 +59,21 @@ PanelWindow {
 
     function open(rm) {
         rightMargin = rm;
-        error = ""; message = ""; pwFor = "";
+        error = ""; message = ""; pwFor = ""; help = false;
         visible = true;
         refresh();
         scan();
         keys.forceActiveFocus();
+        drop.restart();
     }
     function close() { pwFor = ""; visible = false; }
     function toggle(rm) { if (visible) close(); else open(rm); }
 
-    // ---------------- backend ----------------
+    // Messages fade out on their own; errors stay until the next action.
+    Timer { id: messageTimer; interval: 4000; onTriggered: if (!panel.messageBad) panel.message = "" }
+    onMessageChanged: if (message !== "") messageTimer.restart()
+
+    // ---------------- backend (scripts/wifi.sh) ----------------
     function parse(text) {
         var nets = [], sawNets = false;
         for (const line of text.split("\n")) {
@@ -79,20 +82,19 @@ PanelWindow {
                 error = f.slice(1).join("|");
             } else if (f[0] === "STATE") {
                 error = "";
-                wpaState = f[1]; currentSsid = f[2]; ip = f[3]; iface = f[4];
+                wpaState = f[1]; currentSsid = f[2]; ip = f[3]; wifiIface = f[4];
             } else if (f[0] === "NET") {
                 sawNets = true;
                 nets.push({ dbm: Number(f[1]), sec: Number(f[2]),
                             savedId: Number(f[3]), ssid: f.slice(5).join("|") });
             } else if (f[0] === "OK" && f[1]) {
-                message = "joined, " + f[1] + (f[2] ? "  (" + f[2] + ")" : "");
+                message = "joined";
                 messageBad = false;
             } else if (f[0] === "FORGOT") {
                 var gone = forgetting;
                 // Show it as unsaved now instead of waiting for the next scan.
                 networks = networks.map(x => x.ssid === gone ? Object.assign({}, x, { savedId: -1 }) : x);
-                message = "forgot " + gone + (Number(f[1]) > 1 ? " (" + f[1] + " saved copies)" : "")
-                        + (f[2] ? ", " + f[2] : "");
+                message = f[2] ? f[2] : "forgot " + gone;
                 messageBad = f[2] !== "";
                 forgetting = "";
             } else if (f[0] === "FAIL") {
@@ -115,7 +117,6 @@ PanelWindow {
     function refresh() { if (!statusProc.running) statusProc.running = true; }
     Timer { interval: 2000; repeat: true; running: panel.visible; onTriggered: panel.refresh() }
 
-    // Scripts run through `sh`, so a missing executable bit can't stall anything.
     Process {
         id: scanProc
         command: ["sh", panel.script, "scan"]
@@ -143,7 +144,7 @@ PanelWindow {
         onTriggered: if (scanProc.running) {
             scanProc.running = false;
             panel.scanning = false;
-            panel.message = "scan timed out: try `wifi.sh scan` in a terminal";
+            panel.message = "scan timed out";
             panel.messageBad = true;
         }
     }
@@ -209,7 +210,7 @@ PanelWindow {
         cancelForm();
         act(args, pwEap ? "signing in to " + s : "joining " + s, secret);
     }
-    // Shared key handling for the form fields.
+    // Form fields: enter submits, esc cancels, tab cycles, ctrl+h shows the password.
     function formKey(e, field) {
         var order = pwEap ? [idField, pwField, domField] : [pwField];
         var at = order.indexOf(field);
@@ -222,23 +223,16 @@ PanelWindow {
         else return;
         e.accepted = true;
     }
-    // Forget asks twice (d d, or right-click twice) so a stray click can't wipe a login.
+    // Forget asks twice so a stray key or click can't wipe a saved login.
     property string confirmForget: ""
     property string forgetting: ""
-    onSelChanged: if (confirmForget !== "") { confirmForget = ""; message = ""; }
+    onSelChanged: confirmForget = ""
     Timer { id: confirmTimer; interval: 3000; onTriggered: panel.confirmForget = "" }
     function forget(i) {
         var n = networks[i];
-        if (!n || busy !== "") return;
-        if (n.savedId < 0) {
-            message = n.ssid + " isn't saved";
-            messageBad = false;
-            return;
-        }
+        if (!n || busy !== "" || n.savedId < 0) return;
         if (confirmForget !== n.ssid) {
-            confirmForget = n.ssid;
-            message = "forget " + n.ssid + "? press d again";
-            messageBad = true;
+            confirmForget = n.ssid;              // the row's tag turns into "forget?"
             confirmTimer.restart();
             return;
         }
@@ -254,45 +248,47 @@ PanelWindow {
     }
 
     // ---------------- view ----------------
-    component Field: Rectangle {
+    FontMetrics { id: fm; font.family: panel.theme.fontFamily; font.pixelSize: panel.theme.fontSize }
+    readonly property int rowH: Math.ceil(fm.height) + 8
+
+    // One line of the login form, styled like the picker's input.
+    component Field: Item {
         id: fieldBox
         property alias text: input.text
         property string placeholder: ""
         property bool secret: false
         function focusInput() { input.forceActiveFocus(); }
 
-        width: col.width
-        height: panel.rowH + 4
-        color: "transparent"
-        border.width: 1
-        border.color: input.activeFocus ? panel.accentColor : panel.mutedColor
-
+        width: body.width
+        height: panel.rowH
+        Text {
+            id: caret
+            anchors.verticalCenter: parent.verticalCenter
+            text: "›"
+            color: input.activeFocus ? panel.theme.accent3 : panel.theme.muted
+            font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize + 2; bold: true }
+        }
         TextInput {
             id: input
-            anchors.fill: parent
-            anchors.margins: 6
-            verticalAlignment: TextInput.AlignVCenter
+            anchors { left: caret.right; leftMargin: 8; right: parent.right; verticalCenter: parent.verticalCenter }
             echoMode: fieldBox.secret && !panel.showPw ? TextInput.Password : TextInput.Normal
             passwordCharacter: "•"
-            color: panel.textColor
-            selectionColor: panel.accentColor
-            selectedTextColor: panel.bgColor
+            color: panel.theme.foreground
+            selectionColor: panel.theme.accent3
+            selectedTextColor: panel.theme.barColor
+            cursorVisible: activeFocus
             clip: true
-            font { family: panel.fontName; pixelSize: panel.fontSize }
+            font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize }
             Keys.onPressed: e => panel.formKey(e, fieldBox)
         }
         Text {
-            anchors.fill: input
-            verticalAlignment: Text.AlignVCenter
+            anchors { left: input.left; verticalCenter: parent.verticalCenter }
             visible: input.text === ""
             text: fieldBox.placeholder
-            color: panel.mutedColor
-            font { family: panel.fontName; pixelSize: panel.fontSize }
+            color: panel.theme.muted
+            font: input.font
         }
     }
-
-    FontMetrics { id: fm; font.family: panel.fontName; font.pixelSize: panel.fontSize }
-    readonly property int rowH: Math.ceil(fm.height) + 6
 
     // Click-off-to-close: an invisible full-screen layer behind the panel
     // (panel is on Overlay, this on Top) that closes it on any click.
@@ -314,29 +310,42 @@ PanelWindow {
         }
     }
 
+    ParallelAnimation {      // same drop-in as the hover cards
+        id: drop
+        NumberAnimation { target: frame; property: "opacity"; from: 0; to: 1; duration: 140 }
+        NumberAnimation { target: frame; property: "y"; from: -4; to: 0; duration: 180; easing.type: Easing.OutCubic }
+    }
+
     Rectangle {
         id: frame
         width: parent.width
-        implicitHeight: col.implicitHeight + 20
-        color: Qt.rgba(panel.barColor.r, panel.barColor.g, panel.barColor.b, 1)
+        height: body.implicitHeight + 2 * panel.pad + 2
+        color: Qt.rgba(panel.theme.barColor.r, panel.theme.barColor.g, panel.theme.barColor.b, 1)
         border.width: 1
-        border.color: panel.mutedColor
+        border.color: panel.edge
+
+        Rectangle {
+            anchors { top: parent.top; left: parent.left; right: parent.right }
+            height: 2
+            color: panel.wired || panel.connected ? panel.theme.accent3 : panel.theme.accent6
+        }
 
         Item {
             id: keys
             focus: true
             Keys.onPressed: e => {
                 switch (e.key) {
-                case Qt.Key_Escape: panel.close(); break;
+                case Qt.Key_Escape: if (panel.help) panel.help = false; else panel.close(); break;
                 case Qt.Key_Down: case Qt.Key_J:
                     panel.sel = Math.min(panel.sel + 1, panel.networks.length - 1); break;
                 case Qt.Key_Up: case Qt.Key_K:
                     panel.sel = Math.max(panel.sel - 1, 0); break;
                 case Qt.Key_Return: case Qt.Key_Enter: panel.activate(panel.sel); break;
-                case Qt.Key_R: panel.scan(); break;
+                case Qt.Key_R: if (panel.hasWifi) panel.scan(); break;
                 case Qt.Key_E: panel.activate(panel.sel, true); break;
                 case Qt.Key_D: case Qt.Key_Delete: panel.forget(panel.sel); break;
-                case Qt.Key_X: panel.act(["disconnect"], "disconnecting"); break;
+                case Qt.Key_X: if (panel.connected) panel.act(["disconnect"], "disconnecting"); break;
+                case Qt.Key_Question: panel.help = !panel.help; break;
                 default: return;
                 }
                 e.accepted = true;
@@ -344,104 +353,107 @@ PanelWindow {
         }
 
         Column {
-            id: col
-            x: 10; y: 10
-            width: parent.width - 20
-            spacing: 6
+            id: body
+            x: panel.pad
+            y: panel.pad + 2
+            width: parent.width - 2 * panel.pad
+            spacing: 8
 
-            // header: what we're connected to right now
+            // heading: COMMS ......................... scanning… / joining x…
             Item {
-                width: col.width
-                height: panel.rowH
+                width: parent.width
+                height: headText.implicitHeight
                 Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "wifi " + (panel.iface || "")
-                    color: panel.labelColor
-                    font { family: panel.fontName; pixelSize: panel.fontSize }
+                    id: headText
+                    text: "COMMS"
+                    color: panel.wired || panel.connected ? panel.theme.accent3 : panel.theme.accent6
+                    font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize - 3; letterSpacing: 2.5; bold: true }
                 }
                 Text {
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: panel.error ? "unavailable"
-                        : panel.connected ? panel.currentSsid + "  " + (panel.ip || "no address")
-                        : (panel.wpaState || "…").toLowerCase()
-                    color: panel.error ? panel.warnColor : panel.textColor
-                    font { family: panel.fontName; pixelSize: panel.fontSize }
+                    anchors { right: parent.right; baseline: headText.baseline }
+                    text: panel.busy ? panel.busy + "…" : panel.scanning ? "scanning…" : ""
+                    color: panel.label
+                    font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize - 2 }
                 }
             }
 
-            // setup help when nmcli can't reach NetworkManager
-            Text {
-                visible: panel.error.indexOf("NetworkManager") >= 0
-                width: col.width
-                wrapMode: Text.Wrap
-                color: panel.textColor
-                font { family: panel.fontName; pixelSize: panel.fontSize - 1 }
-                text: panel.error + "\n\n" +
-                      "In your NixOS config:\n" +
-                      "  networking.networkmanager.enable = true;\n" +
-                      "  users.users." + (Quickshell.env("USER") || "you") + ".extraGroups = [ \"networkmanager\" ];\n" +
-                      "then rebuild, and log out and back in so the group applies."
+            // the links, as instrument readouts
+            Column {
+                spacing: 4
+                Readout {
+                    visible: panel.wired
+                    theme: panel.theme
+                    k: "wired"
+                    v: Net.iface + "  " + Net.address
+                }
+                Readout {
+                    theme: panel.theme
+                    k: "wi-fi"
+                    v: !panel.hasWifi ? panel.error.replace(/\s*[(:].*$/, "")
+                     : panel.connected ? panel.currentSsid + "  " + (panel.ip || "no address")
+                     : "not connected"
+                    dim: !panel.connected
+                }
             }
 
-            // network list
+            Rectangle { visible: panel.hasWifi; width: parent.width; height: 1; color: panel.edge }
+
+            // networks: same rows as the picker
             ListView {
                 id: list
-                visible: panel.error === ""
-                width: col.width
-                height: Math.max(1, Math.min(count, 10)) * panel.rowH
+                visible: panel.hasWifi && count > 0
+                width: parent.width
+                height: Math.min(count, 10) * panel.rowH
                 clip: true
                 model: panel.networks
                 currentIndex: panel.sel
                 highlightMoveDuration: 0
                 boundsBehavior: Flickable.StopAtBounds
 
-                delegate: Rectangle {
+                delegate: Item {
                     id: row
                     required property var modelData
                     required property int index
                     readonly property bool selected: index === panel.sel
                     readonly property bool isCurrent: panel.connected && modelData.ssid === panel.currentSsid
-                    readonly property color ink: selected ? panel.bgColor : panel.textColor
+                    readonly property bool confirming: modelData.ssid === panel.confirmForget
                     readonly property int lvl: panel.bars(modelData.dbm)
-
+                    readonly property color ink: isCurrent ? panel.theme.accent3
+                                               : selected ? panel.theme.foreground
+                                               : Lib.mix(panel.theme.foreground, panel.theme.muted, 0.25)
                     width: list.width
                     height: panel.rowH
-                    color: selected ? panel.accentColor : "transparent"
 
-                    Row {
-                        anchors.left: parent.left
-                        anchors.leftMargin: 6
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 0
-                        Text {
-                            text: "▂▄▆█".slice(0, row.lvl)
-                            color: row.ink
-                            font { family: panel.fontName; pixelSize: panel.fontSize }
-                        }
-                        Text {
-                            text: "▂▄▆█".slice(row.lvl) + "  "
-                            color: row.selected ? Qt.rgba(panel.bgColor.r, panel.bgColor.g, panel.bgColor.b, 0.35)
-                                                : panel.mutedColor
-                            font { family: panel.fontName; pixelSize: panel.fontSize }
-                        }
-                        Text {
-                            width: list.width - 6 - 8 * fm.averageCharacterWidth - tag.implicitWidth - 12
-                            elide: Text.ElideRight
-                            text: (row.modelData.sec > 0 ? "\uf023 " : "  ") + row.modelData.ssid
-                            color: row.ink
-                            font { family: panel.fontName; pixelSize: panel.fontSize; bold: row.isCurrent }
-                        }
+                    Rectangle {
+                        anchors.fill: parent
+                        visible: row.selected
+                        color: Qt.rgba(panel.theme.accent3.r, panel.theme.accent3.g, panel.theme.accent3.b, 0.14)
+                        Rectangle { width: 2; height: parent.height; color: panel.theme.accent3 }
+                    }
+                    Text {             // signal: lit bars, then the rest in muted
+                        id: sig
+                        anchors { left: parent.left; leftMargin: 10; verticalCenter: parent.verticalCenter }
+                        textFormat: Text.StyledText
+                        text: "▂▄▆█".slice(0, row.lvl) + "<font color='" + panel.theme.muted + "'>" + "▂▄▆█".slice(row.lvl) + "</font>"
+                        color: row.ink
+                        font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize }
+                    }
+                    Text {
+                        anchors { left: sig.right; leftMargin: 10; right: tag.left; rightMargin: 8; verticalCenter: parent.verticalCenter }
+                        text: row.modelData.ssid
+                        elide: Text.ElideRight
+                        color: row.ink
+                        font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize; bold: row.selected || row.isCurrent }
                     }
                     Text {
                         id: tag
-                        anchors.right: parent.right
-                        anchors.rightMargin: 6
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: row.isCurrent ? "connected" : row.modelData.savedId >= 0 ? "saved"
-                            : row.modelData.sec === 2 ? "login" : ""
-                        color: row.selected ? panel.bgColor : row.isCurrent ? panel.accentColor : panel.labelColor
-                        font { family: panel.fontName; pixelSize: panel.fontSize }
+                        anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
+                        text: row.confirming ? "forget?"
+                            : row.modelData.savedId >= 0 ? "saved"
+                            : row.modelData.sec === 2 ? "login"
+                            : row.modelData.sec > 0 ? "" : ""
+                        color: row.confirming ? panel.theme.accent6 : panel.label
+                        font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize - 2 }
                     }
 
                     MouseArea {
@@ -459,47 +471,51 @@ PanelWindow {
             }
 
             Text {
-                visible: panel.error === "" && panel.networks.length === 0
-                text: panel.scanning ? "scanning…" : "no networks found, press r to rescan"
-                color: panel.labelColor
-                font { family: panel.fontName; pixelSize: panel.fontSize }
+                visible: panel.hasWifi && panel.networks.length === 0 && !panel.scanning
+                text: "no networks"
+                color: panel.theme.muted
+                font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize }
             }
 
-            // login form: one field for passwords, three for enterprise (eduroam etc)
+            // login form: one field for a password, three for enterprise (eduroam etc)
             Column {
                 visible: panel.pwFor !== ""
-                width: col.width
-                spacing: 4
+                width: parent.width
+                spacing: 2
 
+                Rectangle { width: parent.width; height: 1; color: panel.edge }
                 Text {
-                    text: (panel.pwEap ? "sign in to " : "password for ") + panel.pwFor
-                    color: panel.labelColor
-                    font { family: panel.fontName; pixelSize: panel.fontSize }
+                    topPadding: 6
+                    text: (panel.pwEap ? "sign in · " : "password · ") + panel.pwFor
+                    color: panel.label
+                    font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize - 2 }
                 }
-                Field { id: idField; visible: panel.pwEap; placeholder: "username (e.g. you@school.edu)" }
+                Field { id: idField; visible: panel.pwEap; placeholder: "username" }
                 Field { id: pwField; secret: true; placeholder: "password" }
-                Field { id: domField; visible: panel.pwEap; placeholder: "server domain (default: part after @)" }
+                Field { id: domField; visible: panel.pwEap; placeholder: "server domain (optional)" }
+                // Kept on purpose: without a domain to check the certificate
+                // against, a fake hotspot with the same name can take the password.
                 Text {
                     visible: panel.pwEap && domField.text.trim() === "" && idField.text.indexOf("@") < 0
-                    width: col.width
+                    width: parent.width
                     wrapMode: Text.Wrap
-                    text: "without a server domain, a fake network with this name could capture your password"
-                    color: panel.warnColor
-                    font { family: panel.fontName; pixelSize: panel.fontSize - 1 }
+                    text: "no domain: the server's certificate can't be checked"
+                    color: panel.theme.accent6
+                    font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize - 3 }
                 }
             }
 
-            // status + hints
+            // messages (errors stay, the rest clear themselves), or ? help
             Text {
-                width: col.width
+                visible: text !== ""
+                width: parent.width
                 wrapMode: Text.Wrap
-                text: panel.busy ? panel.busy + "…"
-                    : panel.message ? panel.message
-                    : panel.pwFor ? "enter join   tab next field   ctrl+h show password   esc cancel"
-                    : (panel.scanning ? "scanning…   " : "") + "enter join   e login   r rescan   d forget   x disconnect   esc"
-                color: panel.message && panel.messageBad ? panel.warnColor
-                     : panel.busy ? panel.accentColor : panel.labelColor
-                font { family: panel.fontName; pixelSize: panel.fontSize - 1 }
+                text: panel.help
+                    ? (panel.pwFor ? "enter join   tab next   ctrl+h show   esc cancel"
+                                   : "enter join   e login   r rescan   d forget   x disconnect   esc")
+                    : panel.message
+                color: panel.messageBad && !panel.help ? panel.theme.accent6 : panel.theme.muted
+                font { family: panel.theme.fontFamily; pixelSize: panel.theme.fontSize - 3 }
             }
         }
     }
