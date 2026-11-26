@@ -106,6 +106,7 @@ Item {
         }
     }
 
+    property real wheel: 0                  // scroll not yet turned into a seek
     MouseArea {
         id: mouse
         anchors.fill: parent
@@ -117,7 +118,17 @@ Item {
             else if (m.button === Qt.RightButton) Media.next();
             else Media.previous();
         }
-        onWheel: w => Media.nudge(w.angleDelta.y > 0 ? 5 : -5)
+        // 5 s per wheel notch. A notch is 120 units of angleDelta, but smooth
+        // (high-resolution) wheels and touchpads deliver it in several smaller
+        // events, so add them up instead of seeking 5 s per event.
+        onWheel: w => {
+            tx.wheel += w.angleDelta.y;
+            var notches = Math.trunc(tx.wheel / 120);
+            if (notches !== 0) {
+                tx.wheel -= notches * 120;
+                Media.nudge(5 * notches);
+            }
+        }
     }
 
     // ---------------- card ----------------

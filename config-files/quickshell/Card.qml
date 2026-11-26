@@ -25,8 +25,8 @@ PopupWindow {
 
     visible: false
     color: "transparent"
-    width: Math.max(body.implicitWidth, head.visible ? head.implicitWidth : 0) + 2 * pad
-    height: stack.implicitHeight + 2 * pad + 2
+    implicitWidth: Math.max(body.implicitWidth, head.visible ? head.implicitWidth : 0) + 2 * pad
+    implicitHeight: stack.implicitHeight + 2 * pad + 2
 
     anchor {
         item: card.target

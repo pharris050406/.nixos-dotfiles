@@ -4,7 +4,6 @@
 
 CACHE="$HOME/.cache/quickshell"
 STATE="$CACHE/selected-player"
-PIDFILE="$CACHE/media-source.pid"
 
 mkdir -p "$CACHE"
 
@@ -34,13 +33,6 @@ current_player() {
     printf '%s\n' "$_list" | head -n 1
 }
 
-# Wake media-source.sh immediately by killing the sleep it is blocked in.
-poke_source() {
-    _sp=$(cat "$PIDFILE" 2>/dev/null)
-    [ -n "$_sp" ] && pkill -P "$_sp" sleep 2>/dev/null
-    return 0
-}
-
 PLAYER=$(current_player)
 
 if [ "$1" = cycle ]; then
@@ -58,8 +50,7 @@ if [ "$1" = cycle ]; then
                 if (a[i] == cur) { print a[i % NR + 1]; exit }
             print a[1]
         }')
-    printf '%s\n' "$next" > "$STATE"
-    poke_source
+    printf '%s\n' "$next" > "$STATE"     # the bar watches this file
     notify_cmd && notify-send -a "${next%%.*}" -t 1500 \
         -h string:x-canonical-private-synchronous:media \
         "Media Focus" "Now controlling: $next"
@@ -103,7 +94,6 @@ case "$1" in
         ;;
 esac
 
-poke_source
 
 # --- notification with album art (best effort) ---
 notify_cmd || exit 0

@@ -2,178 +2,139 @@ pragma Singleton
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Services.Mpris
 
-// Now-playing state. Same media-source.sh and META|/POS| protocol as before,
-// same pinned player (~/.cache/quickshell/selected-player) for controls.
+// Now-playing state, straight from MPRIS over D-Bus (no helper processes).
+//
+// It follows one *pinned* player and never switches on its own: opening
+// YouTube while mpd is pinned changes nothing here. The pin is the player's
+// playerctl-style name in ~/.cache/quickshell/selected-player, written by
+// `media-ctl.sh cycle` (your media key). Same rules as media-ctl.sh:
+//   the pinned player if it's running; else the same app under a new
+//   instance number (firefox.instance_1_3 -> firefox.instance_2_7);
+//   else the first player by name.
 Singleton {
     id: media
 
-    property string status: ""
-    property string track: ""
-    property real length: 0              // seconds
-    property real basePos: 0             // last position the script reported
-    property real baseStamp: 0           // Date.now() when it arrived
-    property real position: 0            // ticks once a second, for text
-    property string playerName: ""
-    property string sourceName: ""       // e.g. "firefox"
-    property string sourceId: ""         // e.g. "firefox.instance_1_3" (what -p wants)
+    // ---------------- which player ----------------
+    property string playerName: ""            // the pin, e.g. "mpd"
 
-    readonly property bool playing: status === "Playing"
-    readonly property bool active: status === "Playing" || status === "Paused"
-
-    // Playhead estimate at this instant (between the script's 1s reports).
-    function estimate() {
-        var p = playing ? basePos + (Date.now() - baseStamp) / 1000 : basePos;
-        return length > 0 ? Math.max(0, Math.min(p, length)) : Math.max(0, p);
-    }
-    function _setPos(p) {
-        basePos = p;
-        baseStamp = Date.now();
-        position = p;
-    }
-
-    Process {
-        command: ["sh", "-c", "exec \"$HOME/.config/quickshell/scripts/media-source.sh\""]
-        running: true
-        stdout: SplitParser {
-            onRead: data => {
-                var val = data.trim();
-                if (val.indexOf("META|") === 0) {
-                    var parts = val.substring(5).split("|");
-                    if (parts.length < 3) return;
-                    var micro = parseFloat(parts[1]);
-                    media.status = parts[0];
-                    if (parts.slice(2).join("|") !== media.track) media._holdUntil = 0;
-                    if (media.active) {
-                        media.length = isNaN(micro) ? 0 : micro / 1000000;
-                        media.track = parts.slice(2).join("|");
-                    } else {
-                        media.length = 0;
-                        media.track = "";
-                        media._setPos(0);
-                    }
-                } else if (val.indexOf("POS|") === 0) {
-                    var p = parseFloat(val.substring(4));
-                    if (isNaN(p)) return;
-                    // Right after a seek, a report can predate it and would yank the
-                    // playhead back. Until one agrees with the seek (or 3 s pass),
-                    // ignore reports that disagree with where we sent it.
-                    if (Date.now() < media._holdUntil) {
-                        if (Math.abs(p - media.estimate()) > 1.5) return;
-                        media._holdUntil = 0;
-                    }
-                    media._setPos(p);
-                }
-            }
-        }
-    }
-
-    // Freeze/unfreeze the playhead where it actually is, not at the last tick.
-    property bool _wasPlaying: false
-    onPlayingChanged: {
-        var p = _wasPlaying ? basePos + (Date.now() - baseStamp) / 1000 : basePos;
-        _wasPlaying = playing;
-        _setPos(length > 0 ? Math.min(p, length) : p);
-    }
-    Timer {
-        interval: 1000; repeat: true; running: media.playing
-        onTriggered: media.position = media.estimate()
-    }
-
-    // ---- which player is actually feeding us (shown in the hover card) ----
     FileView {
         path: Quickshell.env("HOME") + "/.cache/quickshell/selected-player"
         watchChanges: true
+        printErrors: false
         onFileChanged: reload()
-        onLoaded: { media.playerName = text().trim(); media.refreshSource(); }
-        onLoadFailed: { media.playerName = ""; media.refreshSource(); }
+        onLoaded: media.playerName = text().trim()
+        onLoadFailed: media.playerName = ""
     }
 
-    property bool _again: false
-    Process {
-        id: sourceProc
-        command: ["sh", "-c", "playerctl -a metadata --format '{{playerInstance}}|{{title}}' 2>/dev/null"]
-        stdout: StdioCollector {
-            onStreamFinished: {
-                var found = "", match = "";
-                for (const line of this.text.split("\n")) {
-                    var i = line.indexOf("|");
-                    if (i < 0) continue;
-                    var name = line.slice(0, i), title = line.slice(i + 1);
-                    if (name === "playerctld") continue;
-                    if (name === media.playerName) found = name;
-                    if (!match && title && media.track.indexOf(title) >= 0) match = name;
-                }
-                media.sourceId = media.active ? (found || match) : "";
-                media.sourceName = media.sourceId.split(".")[0];
-            }
+    // org.mpris.MediaPlayer2.firefox.instance_1_3 -> firefox.instance_1_3
+    function nameOf(p) { return (p.dbusName || "").replace(/^org\.mpris\.MediaPlayer2\./, ""); }
+
+    readonly property var players: Mpris.players.values
+        .filter(p => nameOf(p) !== "playerctld")        // playerctld mirrors whichever was last active
+        .sort((a, b) => nameOf(a) < nameOf(b) ? -1 : nameOf(a) > nameOf(b) ? 1 : 0)
+
+    readonly property MprisPlayer player: {
+        var ps = players;
+        if (ps.length === 0) return null;
+        var pin = playerName;
+        if (pin !== "") {
+            var exact = ps.find(p => nameOf(p) === pin);
+            if (exact) return exact;
+            var app = pin.split(".")[0];
+            var same = ps.find(p => nameOf(p).indexOf(app) === 0);
+            if (same) return same;
         }
-        onExited: if (media._again) { media._again = false; running = true; }
+        return ps[0];
     }
-    function refreshSource() {
-        if (sourceProc.running) _again = true;
-        else sourceProc.running = true;
-    }
-    onStatusChanged: refreshSource()
-    onTrackChanged: refreshSource()
 
-    // ---- controls: go to the pinned player, same as the keybinds ----
-    Process { id: ctlProc }
-    function ctl(args) {
-        ctlProc.running = false;
-        ctlProc.command = ["sh", "-c",
-            "p=$(cat \"$HOME/.cache/quickshell/selected-player\" 2>/dev/null); " +
-            "exec playerctl ${p:+-p \"$p\"} \"$@\"", "sh"].concat(args);
-        ctlProc.running = true;
-    }
-    function toggle() { ctl(["play-pause"]) }
-    function next() { ctl(["next"]) }
-    function previous() { ctl(["previous"]) }
-    // Seeking. MPRIS has two ways in: SetPosition (absolute) and Seek
-    // (relative). SetPosition carries a track id, and the spec says a player
-    // must *silently ignore* it if the id doesn't match its current one, so
-    // playerctl exits 0 and nothing happens. Seek has no track id, so that's
-    // what we use: ask the player where it really is, seek by the difference,
-    // and only fall back to SetPosition if that fails.
-    // It goes to the player actually feeding the bar (sourceId), else the
-    // pinned one. Clicks during a seek coalesce to the newest target.
-    property real _seekTarget: -1
+    // ---------------- state (same API the widgets already use) ----------------
+    readonly property string status: !player ? ""
+        : player.playbackState === MprisPlaybackState.Playing ? "Playing"
+        : player.playbackState === MprisPlaybackState.Paused ? "Paused" : "Stopped"
+    readonly property bool playing: status === "Playing"
+    readonly property bool active: status === "Playing" || status === "Paused"
+
+    readonly property string track: !active ? ""
+        : player.trackTitle + (player.trackArtist ? " - " + player.trackArtist : "")
+
+    // Length. Firefox drops mpris:length from its metadata after a seek and
+    // only sends it again on the next state change, so the last length a
+    // track reported is remembered and used while that same track plays.
+    readonly property real rawLength: player && player.lengthSupported ? player.length : 0
+    readonly property string trackKey: active ? nameOf(player) + "|" + track : ""
+    property real _knownLength: 0
+    property string _knownFor: ""
+    function _remember() { if (rawLength > 0) { _knownLength = rawLength; _knownFor = trackKey; } }
+    onRawLengthChanged: _remember()
+    onTrackKeyChanged: _remember()
+    readonly property real length: !active ? 0
+        : rawLength > 0 ? rawLength
+        : trackKey === _knownFor ? _knownLength : 0
+
+    readonly property string sourceId: active ? nameOf(player) : ""      // e.g. "firefox.instance_1_3"
+    readonly property string sourceName: sourceId.split(".")[0]          // e.g. "firefox"
+
+    // Position. Reading player.position always gives the current value, but it
+    // only announces jumps (seeks, track changes), not the steady ticking. So:
+    //   basePos     last value read; widgets bind to it to know "something moved"
+    //   position    re-read once a second while playing, for text
+    //   estimate()  the playhead right now, for anything smoother
+    property real basePos: 0
+    property real position: 0
+    property real _seekTarget: -1             // until the player confirms a seek, show where we sent it
     property real _holdUntil: 0
-    Process {
-        id: seekProc
-        stderr: StdioCollector { id: seekErr }
-        onExited: (code, status) => {
-            if (code !== 0)
-                console.warn("seek failed (" + code + "): " + seekErr.text.trim());
-            if (media._seekTarget >= 0) {
-                var t = media._seekTarget;
-                media._seekTarget = -1;
-                Qt.callLater(() => media._runSeek(t));
-            }
+
+    function estimate() {
+        if (!active) return 0;
+        if (Date.now() < _holdUntil) return _seekTarget;
+        var p = player.position;
+        return length > 0 ? Math.max(0, Math.min(p, length)) : Math.max(0, p);
+    }
+    function _sync() {
+        var p = estimate();
+        basePos = p;
+        position = p;
+    }
+
+    Timer {
+        interval: 1000; repeat: true; running: media.playing
+        onTriggered: media._sync()
+    }
+    Connections {                             // seeks and track changes, from anywhere
+        target: media.player
+        function onPositionChanged() {
+            if (Date.now() < media._holdUntil && Math.abs(media.player.position - media._seekTarget) < 1.5)
+                media._endHold();             // the player has caught up with our seek
+            media._sync();
         }
     }
-    function _runSeek(target) {
-        _setPos(target);                         // optimistic
-        _holdUntil = Date.now() + 3000;
-        seekProc.command = ["sh", "-c",
-            "p=$1; t=$2; [ -n \"$p\" ] || p=$(cat \"$HOME/.cache/quickshell/selected-player\" 2>/dev/null); " +
-            "cur=$(playerctl ${p:+-p \"$p\"} position 2>/dev/null); " +
-            "if [ -n \"$cur\" ]; then " +
-            "  d=$(awk -v t=\"$t\" -v c=\"$cur\" 'BEGIN { d = t - c; printf \"%.2f%s\", (d < 0 ? -d : d), (d < 0 ? \"-\" : \"+\") }'); " +
-            "  playerctl ${p:+-p \"$p\"} position \"$d\" && exit 0; " +
-            "fi; " +
-            "exec playerctl ${p:+-p \"$p\"} position \"$t\"",
-            "sh", sourceId, target.toFixed(2)];
-        seekProc.running = true;
-    }
+    onStatusChanged: _sync()
+    onPlayerChanged: { _endHold(); _sync(); }
+    onTrackChanged: _sync()
+
+    function _endHold() { _holdUntil = 0; holdEnd.stop(); }
+    Timer { id: holdEnd; interval: 3000; onTriggered: { media._endHold(); media._sync(); } }
+
+    // ---------------- controls ----------------
+    function toggle() { if (player && player.canTogglePlaying) player.togglePlaying(); }
+    function next() { if (player && player.canGoNext) player.next(); }
+    function previous() { if (player && player.canGoPrevious) player.previous(); }
+
+    // Seeking goes to an absolute position (MPRIS SetPosition). A relative Seek
+    // looks simpler, but Firefox turns it into the page's own skip-forward/back,
+    // and YouTube skips by its own step instead of the amount asked for.
+    // Players that can't report a position get the relative Seek anyway.
     function seek(sec) {
+        if (!active || !player.canSeek) return;
         var target = Math.max(0, length > 0 ? Math.min(sec, length - 1) : sec);
-        if (seekProc.running) {                  // show it now, send it when the last one lands
-            _seekTarget = target;
-            _setPos(target);
-            _holdUntil = Date.now() + 3000;
-        }
-        else _runSeek(target);
+        if (player.positionSupported) player.position = target;
+        else player.seek(target - estimate());
+        _seekTarget = target;                 // show it now; the player catches up
+        _holdUntil = Date.now() + 3000;
+        holdEnd.restart();
+        _sync();
     }
     function nudge(delta) { seek(estimate() + delta) }
 }
